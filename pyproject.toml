@@ -1,0 +1,14 @@
+[project]
+name = "comfyui-crossviewwarp"
+version = "0.9.0"
+description = "CrossView Warp: depth-warp conditioning node + 3D orbit picker for the CrossView-Warp IC-LoRA (LTX-Video 2.3)"
+license = { text = "Apache-2.0" }
+dependencies = ["numba"]
+
+[project.urls]
+Repository = "https://github.com/cseti007/ComfyUI-CrossViewWarp"
+
+[tool.comfy]
+PublisherId = ""
+DisplayName = "CrossView Warp"
+Icon = ""
