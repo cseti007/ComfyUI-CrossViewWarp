@@ -289,11 +289,11 @@ class CrossViewWarp:
                 "depth": ("IMAGE", {
                     "tooltip": "Depth map for the SAME frames, from a Depth Anything V2 node "
                     "(DA-V2 Large). Brightness = depth; polarity is handled by invert_depth."}),
-                "azimuth": ("FLOAT", {"default": 20.0, "min": -180.0, "max": 180.0, "step": 1.0,
+                "azimuth": ("FLOAT", {"default": -30.0, "min": -180.0, "max": 180.0, "step": 1.0,
                     "tooltip": "Horizontal orbit angle (deg). Negative = camera orbits LEFT, "
                     "positive = RIGHT. The strongest control. Reliable up to about +-45, usable "
                     "to +-65; beyond that the hidden side is mostly invented."}),
-                "elevation": ("FLOAT", {"default": 0.0, "min": -90.0, "max": 90.0, "step": 1.0,
+                "elevation": ("FLOAT", {"default": 20.0, "min": -90.0, "max": 90.0, "step": 1.0,
                     "tooltip": "Vertical orbit angle (deg). Positive = camera rises (looks down "
                     "on the subject), negative = looks up. NOTE: the effect is weaker/subtler "
                     "than azimuth - the orbit is stronger horizontally."}),
@@ -307,14 +307,14 @@ class CrossViewWarp:
                 "head_bias": ("FLOAT", {"default": 0.0, "min": -0.5, "max": 0.5, "step": 0.02,
                     "tooltip": "Manual vertical framing shift (fraction of height; + = shift the "
                     "view up). Leave at 0 unless the subject's head gets clipped."}),
-                "depth_ratio": ("FLOAT", {"default": 1.5, "min": 1.5, "max": 1000.0, "step": 0.5,
+                "depth_ratio": ("FLOAT", {"default": 6.0, "min": 1.5, "max": 1000.0, "step": 0.5,
                     "tooltip": "Max far/near depth ratio of the scene. Lower = flatter relief and "
                     "a cleaner warp; higher = more parallax but messier on cluttered scenes. "
                     "Close-up faces: 2.5-4; mid shots: 4-8; deep/wide scenes: 8-16."}),
-                "smooth_depth": ("BOOLEAN", {"default": True,
-                    "tooltip": "Edge-aware depth smoothing before warping. Reduces speckle holes "
-                    "for a cleaner, more coherent warp. Leave ON unless you want the raw "
-                    "point warp."}),
+                "smooth_depth": ("BOOLEAN", {"default": False,
+                    "tooltip": "Edge-aware depth smoothing before warping. Turn ON if the warp "
+                    "has too many speckle holes; it trades a little sharpness for cleaner, more "
+                    "coherent disocclusion."}),
                 "invert_depth": ("BOOLEAN", {"default": False,
                     "tooltip": "Flip depth polarity (near<->far). Leave FALSE for the standard "
                     "ComfyUI DA-V2 node. Turn ON only if the warp looks inside-out (background "
