@@ -263,10 +263,9 @@ def _rot_y(a):
 def _depth_to_z(depth_bhw, invert, ratio=4.0):
     """Normalise a brightness-like depth stack globally -> z (near small, far large).
 
-    `ratio` bounds the far/near depth ratio. The old unbounded mapping
-    (1/(dn+1e-3), ~1000x) exaggerated relative-depth relief on close-ups
-    (a face got ~30% relief vs a real ~10%), turning a 30-deg orbit into a
-    90-deg-looking, smeared warp. Bounded: z = 1/(1/ratio + (1-1/ratio)*dn).
+    `ratio` bounds the far/near depth ratio so close-ups don't get exaggerated
+    relief (which smears the warp and makes a small orbit look much larger):
+    z = 1/(1/ratio + (1-1/ratio)*dn).
     """
     d = depth_bhw.astype(np.float64)
     if invert:
@@ -285,15 +284,15 @@ class CrossViewWarp:
         return {
             "required": {
                 "frames": ("IMAGE", {
-                    "tooltip": "Input video frames = camera A (the source view). "
-                    "Feed the same frames you send to the Depth Anything V2 node."}),
+                    "tooltip": "Input video frames (the source view). Feed the same "
+                    "frames you send to the Depth Anything V2 node."}),
                 "depth": ("IMAGE", {
                     "tooltip": "Depth map for the SAME frames, from a Depth Anything V2 node "
                     "(DA-V2 Large). Brightness = depth; polarity is handled by invert_depth."}),
                 "azimuth": ("FLOAT", {"default": 20.0, "min": -180.0, "max": 180.0, "step": 1.0,
-                    "tooltip": "Horizontal orbit angle (deg). Negative = orbit LEFT, positive = "
-                    "RIGHT. This is the strongest control. For close-up faces keep it small "
-                    "(15-25); wide/full-body shots take larger angles (up to ~90)."}),
+                    "tooltip": "Horizontal orbit angle (deg). Negative = camera orbits LEFT, "
+                    "positive = RIGHT. The strongest control. Reliable up to about +-45, usable "
+                    "to +-65; beyond that the hidden side is mostly invented."}),
                 "elevation": ("FLOAT", {"default": 0.0, "min": -90.0, "max": 90.0, "step": 1.0,
                     "tooltip": "Vertical orbit angle (deg). Positive = camera rises (looks down "
                     "on the subject), negative = looks up. NOTE: the effect is weaker/subtler "
@@ -303,33 +302,19 @@ class CrossViewWarp:
                     "Below 1 = move closer / zoom in; above 1 = pull back. Extreme values "
                     "enlarge the disoccluded (magenta) holes."}),
                 "hfov": ("FLOAT", {"default": 50.0, "min": 20.0, "max": 120.0, "step": 1.0,
-                    "tooltip": "Horizontal field of view (deg) = the assumed lens. ~50 suits a "
-                    "normal lens; lower = more telephoto (flatter), higher = wider (more "
-                    "perspective distortion). Keep near the source clip's real FOV."}),
-                "splat": ("INT", {"default": 2, "min": 0, "max": 4,
-                    "tooltip": "Point-splat radius in pixels when scattering the warp. Higher = "
-                    "fewer speckle holes but a slightly blurrier/thicker warp; 0 = raw points "
-                    "(most holes). 2 is a good default."}),
+                    "tooltip": "Assumed camera field of view (deg). ~50 is a normal lens. Only "
+                    "change it if your source clip is clearly wide-angle or telephoto."}),
                 "head_bias": ("FLOAT", {"default": 0.0, "min": -0.5, "max": 0.5, "step": 0.02,
-                    "tooltip": "Manual vertical framing shift (fraction of height; + = shift view "
-                    "up). Default 0 = OFF, matching the training-data warps (real cameras, no "
-                    "recentring). Use only if the subject's head gets clipped."}),
+                    "tooltip": "Manual vertical framing shift (fraction of height; + = shift the "
+                    "view up). Leave at 0 unless the subject's head gets clipped."}),
                 "depth_ratio": ("FLOAT", {"default": 1.5, "min": 1.5, "max": 1000.0, "step": 0.5,
-                    "tooltip": "Max far/near depth ratio of the scene. Lower = flatter relief, "
-                    "cleaner warp. Close-up faces: 2.5-4; mid shots: 4-8; deep/wide scenes: "
-                    "8-16. Very high values reproduce the old unbounded behaviour (smeared, "
-                    "over-rotated-looking warps on close-ups)."}),
-                "metric_depth": ("BOOLEAN", {"default": False,
-                    "tooltip": "The depth input is RAW METRIC depth in meters (larger = farther), "
-                    "e.g. from the CrossView Metric Depth node with a metric DA-V2 checkpoint. "
-                    "Uses true 1/z geometry directly - depth_ratio and invert_depth are ignored. "
-                    "This matches the scale-fitted depth of the training data best: the subject "
-                    "keeps its real (thin) depth slab AND the scene keeps its real parallax."}),
+                    "tooltip": "Max far/near depth ratio of the scene. Lower = flatter relief and "
+                    "a cleaner warp; higher = more parallax but messier on cluttered scenes. "
+                    "Close-up faces: 2.5-4; mid shots: 4-8; deep/wide scenes: 8-16."}),
                 "smooth_depth": ("BOOLEAN", {"default": True,
-                    "tooltip": "EXPERIMENTAL: edge-aware depth smoothing (RGB-guided filter + "
-                    "median) before warping. Goal: coherent training-like disocclusion holes "
-                    "instead of shredded speckle (dataset warps: ~55 large magenta regions, 0% "
-                    "pinholes; unsmoothed ours: ~586 fragments). OFF = original behaviour."}),
+                    "tooltip": "Edge-aware depth smoothing before warping. Reduces speckle holes "
+                    "for a cleaner, more coherent warp. Leave ON unless you want the raw "
+                    "point warp."}),
                 "invert_depth": ("BOOLEAN", {"default": False,
                     "tooltip": "Flip depth polarity (near<->far). Leave FALSE for the standard "
                     "ComfyUI DA-V2 node. Turn ON only if the warp looks inside-out (background "
@@ -337,16 +322,22 @@ class CrossViewWarp:
             },
             "optional": {
                 "roll_lock": ("BOOLEAN", {"default": True,
-                    "tooltip": "Keep the subject's in-image lean identical to the source (default). "
-                    "Turn OFF for exact-pose replication experiments - real camera pairs have "
-                    "their own roll."}),
+                    "tooltip": "Keep the subject upright: matches its in-image lean to the source "
+                    "so a tilted source shot doesn't tip the subject over at large angles. "
+                    "Leave ON."}),
                 "pivot_override": ("BOOLEAN", {"default": True,
-                    "tooltip": "EXPERT: orbit around an explicit 3D pivot instead of the "
-                    "auto-estimated scene point. Coordinates are in the SOURCE camera's frame "
-                    "(x right, y down, z forward), in the depth field's units."}),
-                "pivot_x": ("FLOAT", {"default": 0.0, "min": -1000.0, "max": 1000.0, "step": 0.01}),
-                "pivot_y": ("FLOAT", {"default": 0.0, "min": -1000.0, "max": 1000.0, "step": 0.01}),
-                "pivot_z": ("FLOAT", {"default": 1.05, "min": 0.01, "max": 1000.0, "step": 0.01}),
+                    "tooltip": "Orbit around an explicit pivot point (set below) instead of an "
+                    "auto-estimated one. ON by default with a pivot near the subject, which is "
+                    "the recommended setup."}),
+                "pivot_x": ("FLOAT", {"default": 0.0, "min": -1000.0, "max": 1000.0, "step": 0.01,
+                    "tooltip": "Pivot X in the source camera frame (+ = right), in depth units. "
+                    "0 = image centre."}),
+                "pivot_y": ("FLOAT", {"default": 0.0, "min": -1000.0, "max": 1000.0, "step": 0.01,
+                    "tooltip": "Pivot Y (+ = down), in depth units. 0 = image centre."}),
+                "pivot_z": ("FLOAT", {"default": 1.05, "min": 0.01, "max": 1000.0, "step": 0.01,
+                    "tooltip": "Pivot depth (how far in front of the camera). ~1.05 sits on the "
+                    "nearest subject in the middle of the frame; raise it to orbit around "
+                    "something further back."}),
             },
         }
 
@@ -361,16 +352,12 @@ class CrossViewWarp:
     FUNCTION = "build"
     CATEGORY = "CrossView"
 
-    def build(self, frames, depth, azimuth, elevation, distance, hfov, splat, head_bias, depth_ratio, metric_depth, smooth_depth, invert_depth,
-              roll_lock=True, pivot_override=False, pivot_x=0.0, pivot_y=0.0, pivot_z=2.5):
-        # frames: [B,H,W,C] float [0,1]; depth: [B,H,W,C] - [0,1] brightness for
-        # the relative path, raw meters for the metric path (no clamp there!)
+    def build(self, frames, depth, azimuth, elevation, distance, hfov, head_bias, depth_ratio, smooth_depth, invert_depth,
+              roll_lock=True, pivot_override=True, pivot_x=0.0, pivot_y=0.0, pivot_z=1.05):
+        # frames: [B,H,W,C] float [0,1]; depth: [B,H,W,C] brightness [0,1]
         rgb = (frames.clamp(0, 1).cpu().numpy() * 255.0).astype(np.uint8)   # [B,H,W,3]
         B, H, W = rgb.shape[:3]
-        if metric_depth:
-            depth_bhw = depth.mean(dim=-1).cpu().numpy()                    # meters
-        else:
-            depth_bhw = depth.clamp(0, 1).mean(dim=-1).cpu().numpy()        # brightness
+        depth_bhw = depth.clamp(0, 1).mean(dim=-1).cpu().numpy()            # brightness
         if smooth_depth:
             # edge-aware smoothing: median kills salt noise, the RGB-guided
             # filter re-aligns depth edges to image edges -> neighbouring
@@ -383,16 +370,7 @@ class CrossViewWarp:
                 except Exception:
                     d32 = cv2.bilateralFilter(d32, 9, 0.1, 9.0)
                 depth_bhw[i] = d32
-        if metric_depth:
-            # true 1/z geometry, no normalisation heuristics. metric+invert:
-            # the input is raw DISPARITY (1/depth) - useful because 8-bit
-            # encodings keep near-depth precision in disparity space.
-            if invert_depth:
-                z = 1.0 / np.clip(depth_bhw.astype(np.float64), 1e-4, None)
-            else:
-                z = np.clip(depth_bhw.astype(np.float64), 1e-2, None)
-        else:
-            z = _depth_to_z(depth_bhw, invert_depth, depth_ratio)          # [B,H,W]
+        z = _depth_to_z(depth_bhw, invert_depth, depth_ratio)              # [B,H,W]
 
         fx = W / (2.0 * np.tan(np.radians(hfov) / 2.0))
         cc = W / 2.0
@@ -478,7 +456,7 @@ class CrossViewWarp:
         pbar = ProgressBar(B) if ProgressBar is not None else None
         warp_frames = []
         for i in range(B):
-            warp_frames.append(_warp_frame(rgb[i], z[i], C_ref, C_tgt, fx, int(splat), cx_eff, cy_eff))
+            warp_frames.append(_warp_frame(rgb[i], z[i], C_ref, C_tgt, fx, 2, cx_eff, cy_eff))
             if pbar is not None:
                 pbar.update(1)   # advance the node's progress bar one frame
         warp = np.stack(warp_frames, 0)  # [B,H,W,3] uint8
@@ -489,64 +467,5 @@ class CrossViewWarp:
         return (warp_t, orbit_t)
 
 
-class CrossViewMetricDepth:
-    """Raw (un-normalised) DA-V2 depth. The stock DepthAnything_V2 node min-max
-    normalises PER FRAME, which destroys metric meters AND makes the scale
-    wobble frame to frame. This node reuses the same loaded model (wire the
-    DownloadAndLoadDepthAnythingV2Model output in, pick a *metric* checkpoint,
-    e.g. depth_anything_v2_metric_hypersim_vitl) but returns the raw output:
-    METERS for metric checkpoints. Feed into CrossViewWarp with metric_depth=ON.
-    """
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {"required": {
-            "da_model": ("DAMODEL", {"tooltip": "From DownloadAndLoadDepthAnythingV2Model - "
-                                     "use a *metric* checkpoint (hypersim = indoor/general 20m, "
-                                     "vkitti = outdoor/driving 80m)."}),
-            "images": ("IMAGE", {"tooltip": "Same frames you feed to CrossViewWarp."}),
-        }}
-
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("raw_depth",)
-    OUTPUT_TOOLTIPS = ("Raw depth, meters (larger = farther), NOT normalised - values exceed 1. "
-                       "Connect to CrossViewWarp.depth with metric_depth=ON.",)
-    FUNCTION = "process"
-    CATEGORY = "CrossView"
-
-    def process(self, da_model, images):
-        import torch.nn.functional as F
-        from contextlib import nullcontext
-        from torchvision import transforms
-        import comfy.model_management as mm
-        model = da_model["model"]
-        dtype = da_model.get("dtype", torch.float32)
-        device = mm.get_torch_device()
-        B, H, W, _ = images.shape
-        imgs = images.permute(0, 3, 1, 2)
-        H14, W14 = H - (H % 14), W - (W % 14)
-        if H14 != H or W14 != W:
-            imgs = F.interpolate(imgs, size=(H14, W14), mode="bilinear")
-        imgs = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])(imgs)
-        pbar = ProgressBar(B) if ProgressBar is not None else None
-        out = []
-        model.to(device)
-        autocast = (dtype != torch.float32) and not mm.is_device_mps(device)
-        with torch.no_grad():
-            with torch.autocast(mm.get_autocast_device(device), dtype=dtype) if autocast else nullcontext():
-                for img in imgs:
-                    d = model(img.unsqueeze(0).to(device))     # raw: meters (metric ckpt)
-                    out.append(d.cpu().float())
-                    if pbar is not None:
-                        pbar.update(1)
-        model.to(mm.unet_offload_device())
-        d = torch.cat(out, dim=0)                              # [B,H',W']
-        if d.shape[-2] != H or d.shape[-1] != W:
-            d = F.interpolate(d.unsqueeze(1), size=(H, W), mode="bilinear")[:, 0]
-        return (d.unsqueeze(-1).repeat(1, 1, 1, 3),)
-
-
-NODE_CLASS_MAPPINGS = {"CrossViewWarp": CrossViewWarp,
-                       "CrossViewMetricDepth": CrossViewMetricDepth}
-NODE_DISPLAY_NAME_MAPPINGS = {"CrossViewWarp": "CrossView Warp (video -> warp)",
-                              "CrossViewMetricDepth": "CrossView Metric Depth (raw DA-V2)"}
+NODE_CLASS_MAPPINGS = {"CrossViewWarp": CrossViewWarp}
+NODE_DISPLAY_NAME_MAPPINGS = {"CrossViewWarp": "CrossView Warp (video -> warp)"}
