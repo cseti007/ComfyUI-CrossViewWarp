@@ -1,1 +1,7 @@
-numba
+# No required runtime dependencies — the node runs on NumPy + PyTorch, which
+# ComfyUI already provides.
+#
+# numba is an OPTIONAL speed-up (JIT-compiles the warp loop, ~10x faster). It is
+# intentionally NOT listed here so ComfyUI-Manager won't auto-install it, because
+# numba pins a bounded NumPy range and can break other custom nodes. See the
+# README "Optional: faster warp (numba)" section before installing it.

@@ -20,13 +20,28 @@ https://huggingface.co/Cseti/LTX2.3-22B_IC-LoRA-CrossView-Warp
 ```
 cd ComfyUI/custom_nodes
 git clone https://github.com/cseti007/ComfyUI-CrossViewWarp
-pip install -r ComfyUI-CrossViewWarp/requirements.txt
 ```
 
-Then restart ComfyUI and refresh the browser.
+Then restart ComfyUI and refresh the browser. There are no required packages to
+install — the node runs on NumPy + PyTorch, which ComfyUI already provides.
 
-`numba` is the only dependency and it's optional in practice — without it the
-node still works, just ~10x slower on the warp step.
+### Optional: faster warp (numba)
+
+The warp step splats every source pixel into the new view in a tight loop. With
+[`numba`](https://numba.pydata.org/) installed, that loop is JIT-compiled and the
+warp runs ~10x faster. Without it the node uses a pure-NumPy fallback and produces
+the exact same result, just slower — so numba is a pure speed-up, never required.
+
+It is deliberately **not** in `requirements.txt` / `pyproject.toml`, so
+ComfyUI-Manager won't pull it in automatically. The reason: `numba` depends on
+`llvmlite` and pins a bounded NumPy version range, so installing it into an
+existing ComfyUI environment can force a NumPy up-/down-grade that breaks other
+custom nodes. Only add it if you want the speed-up and know your environment can
+take it:
+
+```
+pip install numba
+```
 
 ## Prerequisites
 
