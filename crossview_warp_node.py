@@ -22,6 +22,19 @@ except Exception:  # allow standalone import (tests / non-ComfyUI use)
 
 MAGENTA = np.array([255, 0, 255], dtype=np.uint8)
 
+
+def _dist_scale(d):
+    """Map source-distance ratio (0.2..3.0) to a canvas radius multiplier.
+
+    Piecewise so dist=1.0 lands exactly on the shell (multiplier 1.0):
+    dist<=1 spreads 0.45..1.0 (inside the shell = closer), dist>1 spreads
+    1.0..1.5 so the marker keeps moving visibly all the way up to 3.0
+    (the previous clamp at 1.3 froze it past dist~=1.55)."""
+    d = float(d)
+    if d <= 1.0:
+        return 0.45 + 0.55 * d
+    return 1.0 + 0.25 * (d - 1.0)
+
 try:
     from numba import njit
 
@@ -173,7 +186,7 @@ def _orbit_view_image(azimuth, elevation, distance, size=512):
     d.ellipse([sx - r3, sy - r3, sx + r3, sy + r3], outline=(255, 255, 255, 153), width=max(1, round(k)))
 
     # camera handle at distance-scaled radius, with viewfinder lines
-    distF = float(np.clip(0.45 + 0.55 * distance, 0.45, 1.3))
+    distF = _dist_scale(distance)
     px = cx + vx * distF
     py = cy + vy * distF
     al = 255 if front < 0 else 115
@@ -276,6 +289,67 @@ def _depth_to_z(depth_bhw, invert, ratio=4.0):
     return 1.0 / (1.0 / r + (1.0 - 1.0 / r) * dn)
 
 
+# --- keyframe interpolation --------------------------------------------------
+
+def _wrap_deg(a):
+    """Wrap degrees to (-180, 180]."""
+    return ((a + 180.0) % 360.0) - 180.0
+
+
+def _ease(t, mode):
+    """Map linear t in [0,1] to eased t in [0,1] per the chosen curve."""
+    if mode == "ease_in_out":
+        return 0.5 - 0.5 * np.cos(np.pi * t)
+    if mode == "ease_in":
+        return t * t
+    if mode == "ease_out":
+        return 1.0 - (1.0 - t) * (1.0 - t)
+    return t   # "linear" / unknown -> identity
+
+
+def _interp_value(a, b, t, mode):
+    return a + (b - a) * _ease(t, mode)
+
+
+def _interp_angle(a_deg, b_deg, t, mode):
+    """Shortest-path interpolation on the azimuth circle (handles the seam at +-180)."""
+    diff = _wrap_deg(b_deg - a_deg)
+    return _wrap_deg(a_deg + diff * _ease(t, mode))
+
+
+def _interp_abc(a, b, c, t, smooth):
+    """Three-point scalar interpolation. smooth=True uses a quadratic Bezier
+    whose control point pc = 2*b - 0.5*(a+c) makes the curve pass through b
+    at t=0.5; smooth=False is piecewise linear a->b->c. Both hit a/b/c at
+    t=0/0.5/1."""
+    if smooth:
+        pc = 2.0 * b - 0.5 * (a + c)
+        mt = 1.0 - t
+        return mt * mt * a + 2.0 * mt * t * pc + t * t * c
+    if t <= 0.5:
+        return a + (b - a) * (t / 0.5)
+    return b + (c - b) * ((t - 0.5) / 0.5)
+
+
+def _interp_abc_angle(a_deg, b_deg, c_deg, t, smooth):
+    """Three-point angle interp: unwrap b then c relative to the running
+    tangent so the Bezier control-point math stays continuous across the
+    +-180 seam, then wrap the result back to (-180, 180]."""
+    b_unwrap = a_deg + _wrap_deg(b_deg - a_deg)
+    c_unwrap = b_unwrap + _wrap_deg(c_deg - b_unwrap)
+    return _wrap_deg(_interp_abc(a_deg, b_unwrap, c_unwrap, t, smooth))
+
+
+def _orbit_C_tgt(az_deg, el_deg, dist, pivot):
+    """Camera pose orbiting `pivot` at the requested az/el/dist.
+
+    Mirrors the inline math that was in build(): angle signs are negated so
+    +azimuth = camera orbits RIGHT, +elevation = camera RISES (OpenCV frame)."""
+    R_orbit = _rot_y(np.radians(-az_deg)) @ _rot_x(np.radians(-el_deg))
+    eye = pivot + dist * (R_orbit @ (-pivot))
+    return _look_at(eye, pivot)
+
+
 # --- ComfyUI node ------------------------------------------------------------
 
 class CrossViewWarp:
@@ -338,6 +412,59 @@ class CrossViewWarp:
                     "tooltip": "Pivot depth (how far in front of the camera). ~1.05 sits on the "
                     "nearest subject in the middle of the frame; raise it to orbit around "
                     "something further back."}),
+                # NOTE: new widgets MUST come after the original five optional
+                # ones (roll_lock..pivot_z). ComfyUI stores widget_values
+                # positionally in saved workflows, so inserting a widget in the
+                # middle shifts every downstream value into the wrong slot and
+                # breaks previously saved nodes on load.
+                "use_keyframes": ("BOOLEAN", {"default": False,
+                    "tooltip": "Enable the two-point camera move (A at frame 0 -> B at the last "
+                    "frame), interpolated per-frame following 'interp'. When OFF, the single "
+                    "azimuth/elevation/distance above is applied to every frame. Use S+click on "
+                    "the orbit sphere to set A and B visually."}),
+                "A_azimuth": ("FLOAT", {"default": -30.0, "min": -180.0, "max": 180.0, "step": 1.0,
+                    "tooltip": "Keyframe A: camera azimuth at frame 0 (deg). Hidden in the UI - "
+                    "set it with S+click on the sphere. (Right-click the node to unhide.)"}),
+                "A_elevation": ("FLOAT", {"default": 20.0, "min": -90.0, "max": 90.0, "step": 1.0,
+                    "tooltip": "Keyframe A: camera elevation at frame 0 (deg). Hidden in the UI - "
+                    "set it with S+click on the sphere. (Right-click the node to unhide.)"}),
+                "A_distance": ("FLOAT", {"default": 1.0, "min": 0.2, "max": 3.0, "step": 0.05,
+                    "tooltip": "Keyframe A: camera distance at frame 0 (1.0 = source distance). "
+                    "Drag this slider to push/pull the green A marker along its current direction."}),
+                "B_azimuth": ("FLOAT", {"default": 30.0, "min": -180.0, "max": 180.0, "step": 1.0,
+                    "tooltip": "Keyframe B: camera azimuth at the LAST frame (deg). Hidden in the "
+                    " UI - set it with S+click on the sphere. (Right-click the node to unhide.)"}),
+                "B_elevation": ("FLOAT", {"default": 20.0, "min": -90.0, "max": 90.0, "step": 1.0,
+                    "tooltip": "Keyframe B: camera elevation at the last frame (deg). Hidden in "
+                    "the UI - set it with S+click on the sphere. (Right-click the node to unhide.)"}),
+                "B_distance": ("FLOAT", {"default": 1.0, "min": 0.2, "max": 3.0, "step": 0.05,
+                    "tooltip": "Keyframe B: camera distance at the last frame (1.0 = source "
+                    "distance). Drag this slider to push/pull the green B marker along its "
+                    "current direction."}),
+                "C_azimuth": ("FLOAT", {"default": 0.0, "min": -180.0, "max": 999.0, "step": 1.0,
+                    "tooltip": "Keyframe C: camera azimuth at the midpoint frame (deg). Hidden "
+                    "in the UI - set it with S+click on the sphere. (Right-click the node to "
+                    "unhide.) 999.0 is the 'no C placed' sentinel - max is 999 instead of 180 "
+                    "only so this sentinel passes ComfyUI's input validation; the runtime clamps "
+                    "real values back to the +-180 legal range."}),
+                "C_elevation": ("FLOAT", {"default": 0.0, "min": -90.0, "max": 90.0, "step": 1.0,
+                    "tooltip": "Keyframe C: camera elevation at the midpoint frame (deg). Hidden "
+                    "in the UI - set it with S+click on the sphere. (Right-click the node to "
+                    "unhide.)"}),
+                "C_distance": ("FLOAT", {"default": 1.0, "min": 0.2, "max": 3.0, "step": 0.05,
+                    "tooltip": "Keyframe C: camera distance at the midpoint frame (1.0 = source "
+                    "distance). Drag this slider to push/pull the green C marker along its "
+                    "current direction."}),
+                "interp_motion": (["linear", "ease_in_out", "ease_in", "ease_out"], {"default": "linear",
+                    "tooltip": "Curve used to interpolate between keyframe A and B across the "
+                    "video frames. linear = constant angular speed; ease_in_out = slow start & "
+                    "end (cinematic); ease_in / ease_out = one-sided. Only used when 'use_keyframes' "
+                    "is ON."}),
+                "abc_smooth": ("BOOLEAN", {"default": False,
+                    "tooltip": "Path shape through keyframes A/B/C. OFF (default) = "
+                    "piecewise linear A->B->C (constant angular speed per leg, corner at "
+                    "B). ON = quadratic Bezier that glides through B with no corner. Only "
+                    "used when 'use_keyframes' is ON and C is placed."}),
             },
         }
 
@@ -353,7 +480,12 @@ class CrossViewWarp:
     CATEGORY = "CrossView"
 
     def build(self, frames, depth, azimuth, elevation, distance, hfov, head_bias, depth_ratio, smooth_depth, invert_depth,
-              roll_lock=True, pivot_override=True, pivot_x=0.0, pivot_y=0.0, pivot_z=1.05):
+              roll_lock=True, pivot_override=True, pivot_x=0.0, pivot_y=0.0, pivot_z=1.05,
+              interp_motion="linear", use_keyframes=False,
+              A_azimuth=-30.0, A_elevation=20.0, A_distance=1.0,
+              B_azimuth=30.0, B_elevation=20.0, B_distance=1.0,
+              C_azimuth=0.0, C_elevation=0.0, C_distance=1.0,
+              abc_smooth=False):
         # frames: [B,H,W,C] float [0,1]; depth: [B,H,W,C] brightness [0,1]
         rgb = (frames.clamp(0, 1).cpu().numpy() * 255.0).astype(np.uint8)   # [B,H,W,3]
         B, H, W = rgb.shape[:3]
@@ -393,11 +525,28 @@ class CrossViewWarp:
             pivot = np.array([pivot_x, pivot_y, pivot_z], dtype=np.float64)
 
         C_ref = np.eye(4)
-        # angles are negated so that + azimuth = camera orbits RIGHT and
-        # + elevation = camera RISES (OpenCV frame: x right, y down, z forward)
-        R_orbit = _rot_y(np.radians(-azimuth)) @ _rot_x(np.radians(-elevation))
-        eye = pivot + distance * (R_orbit @ (-pivot))
-        C_tgt = _look_at(eye, pivot)
+
+        # "Base" pose drives roll-lock estimation AND the orbit_view preview.
+        # For a single-pose run this is just (az, el, dist); for a keyframed
+        # run we use the move's midpoint so the upright correction is the
+        # average of where the camera actually lives across the clip.
+        keyframing = bool(use_keyframes and B > 1)
+        # "C exists" is signalled by a sentinel value the JS writes into
+        # C_azimuth whenever kfC is null: 999.0 is outside the legal +-180
+        # range, so an in-range C_azimuth means C has been placed.
+        use_c_path = keyframing and abs(C_azimuth) <= 180.0
+        smooth_abc = bool(abc_smooth)
+        if use_c_path:
+            mid_az = _interp_abc_angle(A_azimuth, B_azimuth, C_azimuth, 0.5, smooth_abc)
+            mid_el = _interp_abc(A_elevation, B_elevation, C_elevation, 0.5, smooth_abc)
+            mid_dist = _interp_abc(A_distance, B_distance, C_distance, 0.5, smooth_abc)
+        elif keyframing:
+            mid_az = _interp_angle(A_azimuth, B_azimuth, 0.5, interp_motion)
+            mid_el = _interp_value(A_elevation, B_elevation, 0.5, interp_motion)
+            mid_dist = _interp_value(A_distance, B_distance, 0.5, interp_motion)
+        else:
+            mid_az, mid_el, mid_dist = azimuth, elevation, distance
+        C_tgt = _orbit_C_tgt(mid_az, mid_el, mid_dist, pivot)
 
         # roll lock: keep the subject's projected in-image lean identical to
         # the source by rolling the camera about its optical axis (a pitched
@@ -436,6 +585,10 @@ class CrossViewWarp:
 
         th_src = _lean(np.stack([uu[subj].astype(np.float64), vv[subj].astype(np.float64)], -1))
         th_tgt = _lean_in(C_tgt)
+        # roll-lock correction is estimated ONCE at the midpoint pose and the
+        # same scalar `applied_droll` is then applied to every per-frame C_tgt
+        # so the subject stays upright consistently across the whole move.
+        applied_droll = 0.0
         if roll_lock and th_src is not None and th_tgt is not None:
             droll = float(np.clip(_wrap(th_tgt - th_src), -np.radians(35), np.radians(35)))
             err0 = abs(_wrap(th_tgt - th_src))
@@ -444,6 +597,7 @@ class CrossViewWarp:
                 C_try[:3, :3] = _rodrigues(C_tgt[:3, 2], cand) @ C_tgt[:3, :3]
                 th_try = _lean_in(C_try)
                 if th_try is not None and abs(_wrap(th_try - th_src)) < err0 - 1e-6:
+                    applied_droll = cand
                     C_tgt = C_try
                     break
 
@@ -456,13 +610,33 @@ class CrossViewWarp:
         pbar = ProgressBar(B) if ProgressBar is not None else None
         warp_frames = []
         for i in range(B):
-            warp_frames.append(_warp_frame(rgb[i], z[i], C_ref, C_tgt, fx, 2, cx_eff, cy_eff))
+            if use_c_path:
+                t = i / (B - 1)
+                fr_az = _interp_abc_angle(A_azimuth, B_azimuth, C_azimuth, t, smooth_abc)
+                fr_el = _interp_abc(A_elevation, B_elevation, C_elevation, t, smooth_abc)
+                fr_dist = _interp_abc(A_distance, B_distance, C_distance, t, smooth_abc)
+                C_tgt_i = _orbit_C_tgt(fr_az, fr_el, fr_dist, pivot)
+                if applied_droll != 0.0:
+                    C_tgt_i = C_tgt_i.copy()
+                    C_tgt_i[:3, :3] = _rodrigues(C_tgt_i[:3, 2], applied_droll) @ C_tgt_i[:3, :3]
+            elif keyframing:
+                t = i / (B - 1)
+                fr_az = _interp_angle(A_azimuth, B_azimuth, t, interp_motion)
+                fr_el = _interp_value(A_elevation, B_elevation, t, interp_motion)
+                fr_dist = _interp_value(A_distance, B_distance, t, interp_motion)
+                C_tgt_i = _orbit_C_tgt(fr_az, fr_el, fr_dist, pivot)
+                if applied_droll != 0.0:
+                    C_tgt_i = C_tgt_i.copy()
+                    C_tgt_i[:3, :3] = _rodrigues(C_tgt_i[:3, 2], applied_droll) @ C_tgt_i[:3, :3]
+            else:
+                C_tgt_i = C_tgt
+            warp_frames.append(_warp_frame(rgb[i], z[i], C_ref, C_tgt_i, fx, 2, cx_eff, cy_eff))
             if pbar is not None:
                 pbar.update(1)   # advance the node's progress bar one frame
         warp = np.stack(warp_frames, 0)  # [B,H,W,3] uint8
 
         warp_t = torch.from_numpy(warp.astype(np.float32) / 255.0)
-        orbit = _orbit_view_image(azimuth, elevation, distance)
+        orbit = _orbit_view_image(mid_az, mid_el, mid_dist)
         orbit_t = torch.from_numpy(orbit.astype(np.float32) / 255.0)[None]  # [1,H,W,3]
         return (warp_t, orbit_t)
 
