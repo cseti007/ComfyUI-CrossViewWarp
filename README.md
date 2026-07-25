@@ -80,6 +80,17 @@ Key inputs (all have tooltips in the UI):
   source, so a tilted source shot doesn't tip the character over at large
   angles
 
+### Keyframed camera move (S + click)
+
+Hold **S** and click on the orbit sphere to place keyframe markers **A** (frame
+0), **B** (last frame), and optionally **C** . Drag a marker to move
+it, **hover a marker and scroll the mouse wheel to change its distance**,
+S+click an existing marker to delete it. Placing A and B auto-enables
+`use_keyframes`; toggling it off leaves the markers visible but dimmed to 20%,
+so you can see the setup without it being active. Two points (A+B) give a
+linear move; adding C bends the path through B (with `abc_smooth` you can round
+the corner into a Bezier).
+
 ## Generation settings that worked for me
 
 - IC-LoRA strength **1.3** for characters, **1.0–1.15** for cars and other
