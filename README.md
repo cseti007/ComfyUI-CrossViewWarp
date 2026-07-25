@@ -69,28 +69,24 @@ Key inputs (all have tooltips in the UI):
 - `azimuth` / `elevation` / `distance` — the camera offset. Stay in the green
   zone of the picker: azimuth up to ±45°, elevation +30°/−15° (yellow up to
   ±65° works with degrading quality). Avoid near-zero angles — the LoRA
-  misbehaves when the warp is almost identical to the source.
-- `depth_ratio` (default 1.5) — how much depth relief the warp gets. The low
+  misbehaves when the warp is almost identical to the source. **Important: Unfortunately distance doesn't work as expected due to some dataset problems which will be solved in the next release.**
+- `depth_ratio` (default 6.0) — how much depth relief the warp gets. The low
   default keeps the subject readable in the warp; raising it gives more
   parallax but shreds cluttered scenes.
-- `pivot_override` + `pivot_x/y/z` (default on, z=1.05) — orbit around the
-  subject instead of the scene center. The default puts the pivot on the
+- `pivot_override` + `pivot_x/y/z` (default on, z=1.05) The default puts the pivot on the
   nearest thing in the middle of the frame, which is usually your subject.
-- `smooth_depth` — edge-aware depth smoothing, fewer speckle holes in the warp
+- `smooth_depth` — (default off) edge-aware depth smoothing, fewer speckle holes in the warp.
 - `roll_lock` (default on) — keeps the subject's in-image lean the same as the
   source, so a tilted source shot doesn't tip the character over at large
   angles
-- `metric_depth` + the **CrossView Metric Depth** helper node — feed raw
-  metric depth (meters) instead of normalized depth, for experiments
 
 ## Generation settings that worked for me
 
 - IC-LoRA strength **1.3** for characters, **1.0–1.15** for cars and other
   content the base model has strong opinions about
 - Both IC-LoRA reference guides at `latent_downscale_factor = 1`
-- Distilled-base LoRA at 0.6
 - For `distance > 1`: describe the newly revealed content in the text prompt —
-  the warp can't know what's outside the original frame
+  the warp can't know what's outside the original frame. 
 
 The full settings story and all the limitations are on the
 [LoRA card](https://huggingface.co/Cseti/LTX2.3-22B_IC-LoRA-CrossView-Warp).
