@@ -105,7 +105,7 @@ The path itself lives in the `keyframes` widget as JSON, and you can edit it by
 hand — which is currently the way to fine-tune the timing:
 
 ```json
-[{"f":0,"az":-30,"el":20,"dist":1.0},{"f":48,"az":45,"el":10,"dist":1.2}]
+[{"f":1,"az":-30,"el":20,"dist":1.0},{"f":49,"az":45,"el":10,"dist":1.2}]
 ```
 
 `f` is an absolute frame number. Before the first and after the last keyframe
@@ -120,9 +120,9 @@ evenly across it — the last one always lands on the final frame, and adding or
 deleting a keyframe re-spreads the rest:
 
 ```
-frame_count = 97,  2 keyframes -> f = 0, 96
-                   3 keyframes -> f = 0, 48, 96
-                   5 keyframes -> f = 0, 24, 48, 72, 96
+frame_count = 97,  2 keyframes -> f = 1, 97
+                   3 keyframes -> f = 1, 49, 97
+                   5 keyframes -> f = 1, 25, 49, 73, 97
 ```
 
 Hand-edit any frame number in the widget and the even spread stops being

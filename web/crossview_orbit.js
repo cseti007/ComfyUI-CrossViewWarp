@@ -100,18 +100,19 @@ function segValue(vals, seg, u, smooth) {
   return catmull(p0, p1, p2, p3, u);
 }
 
-// Frame numbers an even spread over 0..last would give to n keyframes.
-function evenFrames(n, last) {
-  if (n <= 1) return n === 1 ? [0] : [];
-  return Array.from({ length: n }, (_, i) => Math.round((i * last) / (n - 1)));
+// Frame numbers an even spread over a `count`-frame clip would give to n
+// keyframes. 1-based: frame 1 is the first frame, frame `count` the last.
+function evenFrames(n, count) {
+  if (n <= 1) return n === 1 ? [1] : [];
+  return Array.from({ length: n }, (_, i) => 1 + Math.round((i * (count - 1)) / (n - 1)));
 }
 
 // True while the path still carries exactly the automatic even spread. This is
 // what lets the spread be re-applied when keyframes are added or removed, yet
 // stop the moment the user hand-edits a frame number in the widget — no extra
 // "is this one locked?" state to store or keep in sync.
-function isAutoTimed(kfs, last) {
-  const want = evenFrames(kfs.length, last);
+function isAutoTimed(kfs, count) {
+  const want = evenFrames(kfs.length, count);
   return kfs.every((k, i) => k.f === want[i]);
 }
 
@@ -384,8 +385,8 @@ class OrbitEditor {
     // re-spread on every add/remove — but only while the timing is still the
     // automatic one. Checked BEFORE the list changes, since a freshly appended
     // keyframe would never match the spread.
-    const last = Math.round(getW(this.node, "frame_count")?.value ?? 0) - 1;
-    const respread = last > 0 && isAutoTimed(this.kfs, last);
+    const count = Math.round(getW(this.node, "frame_count")?.value ?? 0);
+    const respread = count > 1 && isAutoTimed(this.kfs, count);
 
     // Right-click on an existing marker deletes just that one.
     const HIT = 16;
@@ -398,14 +399,14 @@ class OrbitEditor {
         // Seed the path with the pose the user already dialled in, so the move
         // starts where the camera currently is instead of discarding that work.
         const v = this.vals();
-        this.kfs.push({ f: 0, az: v.az, el: v.el, dist: v.dist });
+        this.kfs.push({ f: 1, az: v.az, el: v.el, dist: v.dist });
       }
       const lastF = this.kfs[this.kfs.length - 1].f;
       this.kfs.push({ f: lastF + KF_FRAME_STEP, az, el, dist });
     }
 
     if (respread) {
-      const want = evenFrames(this.kfs.length, last);
+      const want = evenFrames(this.kfs.length, count);
       // A clip too short to hold this many distinct frames would round several
       // keyframes onto the same one, which the node rejects. Leave the existing
       // timing alone in that case rather than generating an invalid path.

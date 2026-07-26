@@ -356,6 +356,9 @@ def _seg_value(vals, seg, u, smooth):
 def _parse_keyframes(raw, frame_count):
     """Parse the `keyframes` widget into a sorted [(frame, az, el, dist), ...].
 
+    Frame numbers are 1-based, matching how the clip reads to a user (frame 1 is
+    the first frame, frame `frame_count` the last); the loop in build() converts.
+
     Empty input means "no camera move". Anything malformed raises ValueError with
     a message written for the user: a silently truncated or misread camera move is
     worse than a failed queue, and every bug class this format replaced was of the
@@ -370,7 +373,7 @@ def _parse_keyframes(raw, frame_count):
     except ValueError as exc:
         raise ValueError(
             "CrossViewWarp: 'keyframes' is not valid JSON (%s). Expected something like "
-            '[{"f":0,"az":-30,"el":20,"dist":1.0},{"f":48,"az":45,"el":10,"dist":1.2}]' % exc
+            '[{"f":1,"az":-30,"el":20,"dist":1.0},{"f":49,"az":45,"el":10,"dist":1.2}]' % exc
         ) from None
     if not isinstance(data, list):
         raise ValueError("CrossViewWarp: 'keyframes' must be a JSON list of keyframe objects.")
@@ -386,13 +389,15 @@ def _parse_keyframes(raw, frame_count):
             raise ValueError(
                 "CrossViewWarp: keyframe #%d needs numeric 'f', 'az', 'el' and 'dist'." % i
             ) from None
-        if f < 0:
-            raise ValueError("CrossViewWarp: keyframe #%d has a negative frame (%d)." % (i, f))
-        if f > frame_count - 1:
+        if f < 1:
             raise ValueError(
-                "CrossViewWarp: keyframe #%d sits at frame %d, but this clip only has %d frames "
-                "(last index %d). The camera path was authored for a longer clip -- move that "
-                "keyframe, or feed a longer clip." % (i, f, frame_count, frame_count - 1))
+                "CrossViewWarp: keyframe #%d sits at frame %d - frame numbers start at 1 "
+                "(frame 1 is the first frame of the clip)." % (i, f))
+        if f > frame_count:
+            raise ValueError(
+                "CrossViewWarp: keyframe #%d sits at frame %d, but this clip only has %d frames. "
+                "The camera path was authored for a longer clip -- move that keyframe, or feed a "
+                "longer clip." % (i, f, frame_count))
         out.append((f, az, el, dist))
 
     out.sort(key=lambda k: k[0])
@@ -414,7 +419,7 @@ def _prepare_path(kfs):
 
 
 def _sample_path(path, frame, easing, smooth):
-    """Camera pose (az, el, dist) at an absolute frame index.
+    """Camera pose (az, el, dist) at a 1-based frame number (1 = first frame).
 
     Outside the keyframed span the pose is HELD rather than extrapolated, so a
     path covering only part of the clip simply stops moving -- that is what makes
@@ -529,7 +534,7 @@ class CrossViewWarp:
                     "every frame. Right-click the orbit sphere to place keyframes."}),
                 "frame_count": ("INT", {"default": 0, "min": 0, "max": 100000, "step": 1,
                     "tooltip": "How many frames the clip has, so the sphere knows where the path "
-                    "ends: new keyframes are then spread evenly from frame 0 to the last frame "
+                    "ends: new keyframes are then spread evenly from frame 1 to the last frame "
                     "instead of the blind 24-frame default. Hand-edit any frame number in "
                     "'keyframes' and the even spread stops being re-applied, leaving your timing "
                     "alone. 0 = off. This is a UI aid - the node always validates keyframes against "
@@ -538,7 +543,7 @@ class CrossViewWarp:
                     "tooltip": "Camera path as JSON, written by right-clicking the orbit sphere - "
                     "you normally never type in here. Each entry is one keyframe: 'f' = frame number, "
                     "'az'/'el' = angles in degrees, 'dist' = distance (1.0 = source). Example: "
-                    '[{"f":0,"az":-30,"el":20,"dist":1.0},{"f":48,"az":45,"el":10,"dist":1.2}] . '
+                    '[{"f":1,"az":-30,"el":20,"dist":1.0},{"f":49,"az":45,"el":10,"dist":1.2}] . '
                     "Before the first and after the last keyframe the pose is held, so a path may "
                     "cover only part of the clip. Empty = no move."}),
                 "interp_motion": (["linear", "ease_in_out", "ease_in", "ease_out"], {"default": "linear",
@@ -628,7 +633,8 @@ class CrossViewWarp:
         keyframing = bool(len(kfs) >= 2 and B > 1)
         smooth_path = (interpolation == "smooth")
         if keyframing:
-            mid_az, mid_el, mid_dist = _sample_path(path, (B - 1) // 2, interp_motion, smooth_path)
+            # middle frame, 1-based: frames run 1..B
+            mid_az, mid_el, mid_dist = _sample_path(path, (B + 1) // 2, interp_motion, smooth_path)
         elif kfs:
             # a single keyframe is not a move -- treat it as the static pose
             mid_az, mid_el, mid_dist = kfs[0][1], kfs[0][2], kfs[0][3]
@@ -699,7 +705,8 @@ class CrossViewWarp:
         warp_frames = []
         for i in range(B):
             if keyframing:
-                fr_az, fr_el, fr_dist = _sample_path(path, i, interp_motion, smooth_path)
+                # i is a 0-based buffer index; keyframes are numbered from 1
+                fr_az, fr_el, fr_dist = _sample_path(path, i + 1, interp_motion, smooth_path)
                 C_tgt_i = _orbit_C_tgt(fr_az, fr_el, fr_dist, pivot)
                 if applied_droll != 0.0:
                     C_tgt_i = C_tgt_i.copy()
