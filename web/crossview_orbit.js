@@ -10,9 +10,12 @@
 // the training dataset uses. Interactions:
 //   - drag the camera handle  -> set azimuth/elevation (snaps to 5 deg)
 //   - drag empty space        -> rotate the VIEW (arcball)
-//   - mouse wheel             -> distance (0.2..3.0)
+//   - mouse wheel             -> distance (0.2..3.0), or a hovered keyframe's
 //   - double click            -> reset the view rotation
-// The azimuth/elevation/distance number widgets stay the source of truth.
+//   - RIGHT-CLICK             -> place a keyframe, or delete the one clicked
+// For a static pose the azimuth/elevation/distance number widgets stay the
+// source of truth; once keyframes exist the `keyframes` JSON widget is, and the
+// static three are hidden because they no longer feed the render.
 
 import { app } from "../../scripts/app.js";
 
@@ -31,9 +34,9 @@ const WIDGET_H = 304;
 // Upper bound for the auto-grown globe (see globeH below) so a very wide node
 // cannot turn the widget into a full-screen canvas.
 const GLOBE_H_MAX = 700;
-// Frames added per newly placed keyframe. The widget cannot know the clip
-// length (only the node sees it at execution), so new keyframes are spaced a
-// second apart at 24fps and the frame numbers stay editable in the widget.
+// Fallback spacing for a new keyframe when `frame_count` is 0 (i.e. the clip
+// length was not supplied): one second apart at 24fps. With frame_count set, the
+// keyframes are spread evenly across the clip instead — see evenFrames().
 const KF_FRAME_STEP = 24;
 
 function inEllipse(az, el, [A, Eup, Edn]) {
@@ -95,6 +98,21 @@ function segValue(vals, seg, u, smooth) {
   const p0 = seg > 0 ? vals[seg - 1] : p1 + (p1 - p2);
   const p3 = seg + 2 < vals.length ? vals[seg + 2] : p2 + (p2 - p1);
   return catmull(p0, p1, p2, p3, u);
+}
+
+// Frame numbers an even spread over 0..last would give to n keyframes.
+function evenFrames(n, last) {
+  if (n <= 1) return n === 1 ? [0] : [];
+  return Array.from({ length: n }, (_, i) => Math.round((i * last) / (n - 1)));
+}
+
+// True while the path still carries exactly the automatic even spread. This is
+// what lets the spread be re-applied when keyframes are added or removed, yet
+// stop the moment the user hand-edits a frame number in the widget — no extra
+// "is this one locked?" state to store or keep in sync.
+function isAutoTimed(kfs, last) {
+  const want = evenFrames(kfs.length, last);
+  return kfs.every((k, i) => k.f === want[i]);
 }
 
 function round1(v) { return Math.round(Number(v) * 10) / 10; }
@@ -223,7 +241,7 @@ class OrbitEditor {
     this.cacheKey = "";
     this._renderKey = "";
 
-    // S+click keyframe state. this.kfs is the single source of truth: an
+    // Keyframe state. this.kfs is the single source of truth: an
     // ordered list of {f, az, el, dist}, serialised verbatim into the
     // `keyframes` widget. Keeping every keyframe in one list (rather than
     // fixed A/B/C slots) is what makes deletion a plain splice and removes
@@ -362,8 +380,14 @@ class OrbitEditor {
     const el = Math.round(ae[1] / SNAP_DEG) * SNAP_DEG;
     const dist = getW(this.node, "distance")?.value ?? 1;
 
-    // S+click on an existing marker deletes just that one; the rest keep their
-    // frame numbers, so removing a middle keyframe does not re-time the move.
+    // With frame_count set, the path spans the whole clip and keyframes are
+    // re-spread on every add/remove — but only while the timing is still the
+    // automatic one. Checked BEFORE the list changes, since a freshly appended
+    // keyframe would never match the spread.
+    const last = Math.round(getW(this.node, "frame_count")?.value ?? 0) - 1;
+    const respread = last > 0 && isAutoTimed(this.kfs, last);
+
+    // Right-click on an existing marker deletes just that one.
     const HIT = 16;
     const hit = this.kfs.findIndex((_, i) => this.kfPos[i] &&
       Math.hypot(x - this.kfPos[i][0], y - this.kfPos[i][1]) <= HIT);
@@ -378,6 +402,16 @@ class OrbitEditor {
       }
       const lastF = this.kfs[this.kfs.length - 1].f;
       this.kfs.push({ f: lastF + KF_FRAME_STEP, az, el, dist });
+    }
+
+    if (respread) {
+      const want = evenFrames(this.kfs.length, last);
+      // A clip too short to hold this many distinct frames would round several
+      // keyframes onto the same one, which the node rejects. Leave the existing
+      // timing alone in that case rather than generating an invalid path.
+      if (new Set(want).size === want.length) {
+        this.kfs.forEach((k, i) => { k.f = want[i]; });
+      }
     }
     this._writeKfWidgets();
     this.render(true);
@@ -436,7 +470,7 @@ class OrbitEditor {
     if (this.handle && Math.hypot(x - this.handle[0], y - this.handle[1]) <= HANDLE_R + 10) {
       this.drag = "cam";
     } else {
-      // grab the nearest keyframe marker to drag it. Plain click only; S+click
+      // grab the nearest keyframe marker to drag it. Left button only; right-click
       // still routes through onKeyframeClick (place/delete).
       const kfIdx = this.pickKf(x, y, 20);
       if (kfIdx >= 0) {
@@ -643,7 +677,7 @@ class OrbitEditor {
       this.handle = null;
     }
 
-    // --- keyframe markers (S+click): green dots joined by a green arc that
+    // --- keyframe markers: green dots joined by a green arc that
     // mirrors the blue home->camera arc above. The arc is walked segment by
     // segment with the same unwrap + Catmull-Rom math the node uses, so what
     // is drawn here is the path that will actually be rendered. Segment

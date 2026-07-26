@@ -13,6 +13,7 @@ consistency and re-centred so an off-centre subject stays framed.
 """
 
 import json
+import logging
 
 import numpy as np
 import torch
@@ -525,10 +526,17 @@ class CrossViewWarp:
                 "use_keyframes": ("BOOLEAN", {"default": False,
                     "tooltip": "Animate the camera along the 'keyframes' path instead of holding "
                     "one pose. When OFF, the single azimuth/elevation/distance above is applied to "
-                    "every frame. Place keyframes with S+click on the orbit sphere."}),
+                    "every frame. Right-click the orbit sphere to place keyframes."}),
+                "frame_count": ("INT", {"default": 0, "min": 0, "max": 100000, "step": 1,
+                    "tooltip": "How many frames the clip has, so the sphere knows where the path "
+                    "ends: new keyframes are then spread evenly from frame 0 to the last frame "
+                    "instead of the blind 24-frame default. Hand-edit any frame number in "
+                    "'keyframes' and the even spread stops being re-applied, leaving your timing "
+                    "alone. 0 = off. This is a UI aid - the node always validates keyframes against "
+                    "the clip it actually receives, and logs a warning if that count differs."}),
                 "keyframes": ("STRING", {"default": "", "multiline": False,
-                    "tooltip": "Camera path as JSON, written by S+click on the orbit sphere - you "
-                    "normally never type in here. Each entry is one keyframe: 'f' = frame number, "
+                    "tooltip": "Camera path as JSON, written by right-clicking the orbit sphere - "
+                    "you normally never type in here. Each entry is one keyframe: 'f' = frame number, "
                     "'az'/'el' = angles in degrees, 'dist' = distance (1.0 = source). Example: "
                     '[{"f":0,"az":-30,"el":20,"dist":1.0},{"f":48,"az":45,"el":10,"dist":1.2}] . '
                     "Before the first and after the last keyframe the pose is held, so a path may "
@@ -561,7 +569,8 @@ class CrossViewWarp:
 
     def build(self, frames, depth, azimuth, elevation, distance, hfov, head_bias, depth_ratio, smooth_depth, invert_depth,
               roll_lock=True, pivot_override=True, pivot_x=0.0, pivot_y=0.0, pivot_z=1.05,
-              use_keyframes=False, keyframes="", interp_motion="linear", interpolation="linear"):
+              use_keyframes=False, frame_count=0, keyframes="", interp_motion="linear",
+              interpolation="linear"):
         # frames: [B,H,W,C] float [0,1]; depth: [B,H,W,C] brightness [0,1]
         rgb = (frames.clamp(0, 1).cpu().numpy() * 255.0).astype(np.uint8)   # [B,H,W,3]
         B, H, W = rgb.shape[:3]
@@ -606,6 +615,14 @@ class CrossViewWarp:
         # For a single-pose run this is just (az, el, dist); for a keyframed
         # run we use the move's midpoint so the upright correction is the
         # average of where the camera actually lives across the clip.
+        if use_keyframes and frame_count and frame_count != B:
+            # `frame_count` only tells the widget where to space keyframes; the clip
+            # in hand is the authority. Worth saying out loud, because a stale value
+            # here means the path was laid out for a different length.
+            logging.warning(
+                "CrossViewWarp: frame_count is %d but this clip has %d frames - the camera path "
+                "was spaced for a different length. Update frame_count to re-space new keyframes.",
+                frame_count, B)
         kfs = _parse_keyframes(keyframes, B) if use_keyframes else []
         path = _prepare_path(kfs) if kfs else None
         keyframing = bool(len(kfs) >= 2 and B > 1)

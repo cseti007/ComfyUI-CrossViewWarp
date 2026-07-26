@@ -115,8 +115,20 @@ past the end of the clip is an error rather than a silently truncated move, so a
 path authored for a longer clip tells you instead of quietly doing the wrong
 thing.
 
-New keyframes are placed 24 frames apart, since the widget cannot know the
-clip's length or frame rate — retime them in the widget as needed.
+Set `frame_count` to your clip's length and the sphere will spread keyframes
+evenly across it — the last one always lands on the final frame, and adding or
+deleting a keyframe re-spreads the rest:
+
+```
+frame_count = 97,  2 keyframes -> f = 0, 96
+                   3 keyframes -> f = 0, 48, 96
+                   5 keyframes -> f = 0, 24, 48, 72, 96
+```
+
+Hand-edit any frame number in the widget and the even spread stops being
+re-applied, so your timing survives further edits on the sphere. Leave
+`frame_count` at 0 and new keyframes are simply placed 24 frames apart, as the
+widget has no way of knowing the clip length on its own.
 
 Two options shape the result:
 
