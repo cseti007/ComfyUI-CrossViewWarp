@@ -80,13 +80,20 @@ Key inputs (all have tooltips in the UI):
   source, so a tilted source shot doesn't tip the character over at large
   angles
 
-### Keyframed camera move (S + click)
+### Keyframed camera move (right-click)
 
-Hold **S** and click on the orbit sphere to place a camera keyframe. The first
-click also captures your current azimuth/elevation/distance as the starting
-keyframe, so one click gives you a complete move. Drag a marker to move it,
-hover it and scroll the wheel to dolly it, S+click it to delete it. Each marker
-is labelled with its **frame number**.
+**Right-click** the orbit sphere to place a camera keyframe. The first one also
+captures your current azimuth/elevation/distance as the starting keyframe, so a
+single right-click gives you a complete move. Left-drag a marker to move it,
+hover it and scroll the wheel to dolly it, right-click it again to delete it.
+Each marker is labelled with its **frame number**.
+
+The gesture is deliberately mouse-only. A modifier key can be claimed by any
+other node pack through ComfyUI's keybinding system — KJNodes, for one, binds S
+to a node-swap gesture that disconnects and repositions whatever node is under
+the cursor — so the sphere uses a plain mouse button that nothing else can
+intercept. Note that right-clicking inside the sphere therefore does not open the
+node's context menu; right-click the node's title or body for that.
 
 Placing a second keyframe enables `use_keyframes` and hides the static
 azimuth/elevation/distance (they do nothing while a move is running, and come

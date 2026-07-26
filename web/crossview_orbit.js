@@ -240,40 +240,39 @@ class OrbitEditor {
     // the user can see the keyframed move is disabled without losing the
     // placements they made.
     this.useKeyframes = false;
-    this.sHeld = false;    // 'S' modifier currently down (only counts when
-    // the pointer is over our canvas, so ComfyUI's own 'S' shortcut still
-    // works elsewhere)
-    this._mouseOver = false;
 
     canvas.addEventListener("pointerdown", (e) => {
       canvas.setPointerCapture?.(e.pointerId);
       this.onDown(e);
+    });
+    // Right-click places (or, on a marker, deletes) a keyframe. Deliberately a
+    // pure pointer gesture with no keyboard modifier: a modifier key can always
+    // be claimed by another node pack through ComfyUI's keybinding system, and
+    // that is exactly what bit this widget before -- KJNodes binds S to its
+    // node-swap gesture, whose pointerup handler called disconnectAll() on the
+    // node under the cursor, tearing every link off CrossViewWarp and swapping
+    // its position. A mouse button on our own canvas cannot be hijacked that way.
+    canvas.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const [x, y] = this.canvasPos(e);
+      this.onKeyframeClick(x, y);
+    });
+    // Second line of defence against document-level gesture handlers from other
+    // packs (KJNodes' node-swap reacts on `document` pointerup): a release that
+    // belongs to this widget must not bubble out of it. Because pointerdown sets
+    // pointer capture, every pointerup of our gesture retargets here -- including
+    // releases outside the canvas -- so onUp() has to be driven from here rather
+    // than relying on the document listener that stopPropagation now blocks.
+    canvas.addEventListener("pointerup", (e) => {
+      e.stopPropagation();
+      if (this.drag) this.onUp();
     });
     canvas.addEventListener("wheel", (e) => this.onWheel(e), { passive: false });
     canvas.addEventListener("dblclick", () => {
       this.view.viewYaw = 0.24; this.view.viewTilt = 0.20;
       this.render(true);
     });
-    canvas.addEventListener("mouseenter", () => { this._mouseOver = true; });
-    canvas.addEventListener("mouseleave", () => { this._mouseOver = false; this.sHeld = false; });
-    this._onKeyDown = (e) => {
-      if (!this._mouseOver) return;
-      // Never swallow a modified chord: Ctrl+S is ComfyUI's Save Workflow, and
-      // latching sHeld on it would leave the next plain click placing a
-      // keyframe the user never asked for.
-      if (e.ctrlKey || e.metaKey || e.altKey) return;
-      if (e.target && (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA")) return;
-      if (e.key === "s" || e.key === "S") {
-        this.sHeld = true;
-        e.preventDefault();
-      }
-    };
-    this._onKeyUp = (e) => {
-      if (e.key === "s" || e.key === "S") this.sHeld = false;
-    };
-    document.addEventListener("keydown", this._onKeyDown);
-    document.addEventListener("keyup", this._onKeyUp);
-
     this._onMove = (e) => this.onMove(e);
     this._onUp = () => this.onUp();
 
@@ -282,8 +281,6 @@ class OrbitEditor {
     // and overwriting it would leak the widget registration instead.
     const prevRemoved = node.onRemoved;
     node.onRemoved = function () {
-      document.removeEventListener("keydown", self._onKeyDown);
-      document.removeEventListener("keyup", self._onKeyUp);
       document.removeEventListener("pointermove", self._onMove);
       document.removeEventListener("pointerup", self._onUp);
       return prevRemoved?.apply(this, arguments);
@@ -425,12 +422,10 @@ class OrbitEditor {
   }
   onDown(e) {
     e.preventDefault(); e.stopPropagation();
+    // Left button only. A right-click also fires pointerdown, and without this
+    // the keyframe gesture would start a view drag underneath itself.
+    if (e.button !== 0) return;
     const [x, y] = this.canvasPos(e);
-    // S + click = keyframe placement (intercept before any drag begins)
-    if (this.sHeld) {
-      this.onKeyframeClick(x, y);
-      return;
-    }
     // ORDER MATTERS: camera handle first — if it sits ON a snap dot, the dot
     // must not steal the grab (that made the handle feel "stuck").
     if (this._resetBtn && Math.hypot(x - this._resetBtn[0], y - this._resetBtn[1]) < 14) {
@@ -709,6 +704,15 @@ class OrbitEditor {
     // one thing the sphere cannot show geometrically, and it is what the user
     // edits in the keyframes widget.
     this.kfPos = this.kfs.map((kf) => drawKf(kf, String(kf.f)));
+
+    // A right-click gesture is not discoverable on its own, so say so — but only
+    // until the first keyframe exists, after which the hint has done its job.
+    if (!this.kfs.length) {
+      ctx.fillStyle = "rgba(200,204,216,0.45)";
+      ctx.font = "11px monospace";
+      const hint = "right-click: add camera keyframe";
+      ctx.fillText(hint, (W - ctx.measureText(hint).width) / 2, H - 8);
+    }
   }
 }
 
