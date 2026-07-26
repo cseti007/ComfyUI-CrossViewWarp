@@ -62,10 +62,13 @@ except Exception:
     _HAVE_NUMBA = False
 
 
-def _orbit_view_image(azimuth, elevation, distance, size=512):
+def _orbit_view_image(azimuth, elevation, distance, size=512, kfs=None, smooth=False):
     """1:1 port of the crossview_orbit.js widget's default view (gizmo style):
     coverage zone hint, equator/meridian rings, snap dots (F/L/R/+-90/H/Lo),
-    dolly ray + 1.0x tick, camera handle with viewfinder lines."""
+    dolly ray + 1.0x tick, camera handle with viewfinder lines.
+
+    Pass `kfs` (the parsed keyframe list) to draw the camera PATH instead of the
+    single pose -- green arc plus frame-numbered markers, matching the widget."""
     from PIL import Image, ImageDraw, ImageFont
     W = H = size
     k = size / 300.0                     # widget geometry is authored at ~300px height
@@ -171,40 +174,103 @@ def _orbit_view_image(azimuth, elevation, distance, size=512):
             bb = d.textbbox((0, 0), lab, font=f_dot)
             d.text((sxp - (bb[2] - bb[0]) / 2, syp - (bb[3] - bb[1]) / 2 - bb[1]), lab, fill=tcol, font=f_dot)
 
-    # arc home -> camera (width 2.5 @300px)
-    for i in range(14):
-        x1, y1, _ = pt(azimuth * i / 14.0, elevation * i / 14.0)
-        x2, y2, _ = pt(azimuth * (i + 1) / 14.0, elevation * (i + 1) / 14.0)
-        d.line([x1, y1, x2, y2], fill=(120, 190, 255, 255), width=max(2, round(2.5 * k)))
+    def dashed(x1, y1, x2, y2, col, w):
+        seg = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5 + 1e-9
+        dash, gap = 4 * k, 4 * k
+        t = 0.0
+        while t < seg:
+            t2 = min(t + dash, seg)
+            d.line([x1 + (x2 - x1) * t / seg, y1 + (y2 - y1) * t / seg,
+                    x1 + (x2 - x1) * t2 / seg, y1 + (y2 - y1) * t2 / seg], fill=col, width=w)
+            t = t2 + gap
 
-    # dolly ray (dashed, subject -> 1.32x) + 1.0x tick
-    sx, sy, front = pt(azimuth, elevation)
-    vx, vy = sx - cx, sy - cy
-    L = (vx * vx + vy * vy) ** 0.5 + 1e-9
-    dash, gap = 4 * k, 4 * k
-    t = 0.0
-    while t < 1.32 * L:
-        t2 = min(t + dash, 1.32 * L)
-        d.line([cx + vx / L * t, cy + vy / L * t, cx + vx / L * t2, cy + vy / L * t2],
-               fill=(120, 190, 255, 90), width=max(1, round(k)))
-        t = t2 + gap
-    r3 = 3 * k
-    d.ellipse([sx - r3, sy - r3, sx + r3, sy + r3], outline=(255, 255, 255, 153), width=max(1, round(k)))
+    def dim(col, front):
+        """Fade a colour toward the background for markers on the far side.
 
-    # camera handle at distance-scaled radius, with viewfinder lines
-    distF = _dist_scale(distance)
-    px = cx + vx * distF
-    py = cy + vy * distF
-    al = 255 if front < 0 else 115
-    for dx, dy in ((-8, -6), (8, -6), (-8, 6), (8, 6)):
-        d.line([px, py, cx + dx * k, cy + (dy - 6) * k], fill=(120, 190, 255, al), width=max(1, round(k)))
-    d.rounded_rectangle([px - 13 * k, py - 9 * k, px + 13 * k, py + 9 * k], radius=4 * k,
-                        fill=(120, 190, 255, al), outline=(255, 255, 255, al), width=max(2, round(2 * k)))
-    r35 = 3.5 * k
-    d.ellipse([px + 5 * k - r35, py - r35, px + 5 * k + r35, py + r35], fill=(32, 36, 44, al))
+        Done by mixing rather than by an alpha value: this ImageDraw writes
+        straight onto an opaque image, so an alpha in the fill would be dropped
+        by the final convert("RGB") and the marker would come out full strength."""
+        if front < 0:
+            return col + (255,)
+        return tuple(round(c + (b - c) * 0.55) for c, b in zip(col, (27, 27, 31))) + (255,)
 
-    d.text((8 * k, 6 * k), f"az {azimuth:+.0f}  el {elevation:+.0f}  dist {distance:.2f}x",
-           fill=(255, 255, 100, 255), font=f_txt)
+    if not kfs:
+        # Static pose: the blue camera overlay. Skipped entirely during a
+        # keyframed move (as the widget does), since azimuth/elevation/distance
+        # do not drive the render then and drawing both would show two cameras.
+
+        # arc home -> camera (width 2.5 @300px)
+        for i in range(14):
+            x1, y1, _ = pt(azimuth * i / 14.0, elevation * i / 14.0)
+            x2, y2, _ = pt(azimuth * (i + 1) / 14.0, elevation * (i + 1) / 14.0)
+            d.line([x1, y1, x2, y2], fill=(120, 190, 255, 255), width=max(2, round(2.5 * k)))
+
+        # dolly ray (dashed, subject -> 1.32x) + 1.0x tick
+        sx, sy, front = pt(azimuth, elevation)
+        vx, vy = sx - cx, sy - cy
+        L = (vx * vx + vy * vy) ** 0.5 + 1e-9
+        dashed(cx, cy, cx + vx / L * 1.32 * L, cy + vy / L * 1.32 * L,
+               (120, 190, 255, 90), max(1, round(k)))
+        r3 = 3 * k
+        d.ellipse([sx - r3, sy - r3, sx + r3, sy + r3], outline=(255, 255, 255, 153),
+                  width=max(1, round(k)))
+
+        # camera handle at distance-scaled radius, with viewfinder lines
+        distF = _dist_scale(distance)
+        px = cx + vx * distF
+        py = cy + vy * distF
+        al = 255 if front < 0 else 115
+        for dx, dy in ((-8, -6), (8, -6), (-8, 6), (8, 6)):
+            d.line([px, py, cx + dx * k, cy + (dy - 6) * k], fill=(120, 190, 255, al),
+                   width=max(1, round(k)))
+        d.rounded_rectangle([px - 13 * k, py - 9 * k, px + 13 * k, py + 9 * k], radius=4 * k,
+                            fill=(120, 190, 255, al), outline=(255, 255, 255, al),
+                            width=max(2, round(2 * k)))
+        r35 = 3.5 * k
+        d.ellipse([px + 5 * k - r35, py - r35, px + 5 * k + r35, py + r35], fill=(32, 36, 44, al))
+
+        label = f"az {azimuth:+.0f}  el {elevation:+.0f}  dist {distance:.2f}x"
+    else:
+        # Keyframed move: the same green path the orbit widget draws, so this
+        # output documents the actual camera move rather than one pose from it.
+        # Walked segment by segment with the shared unwrap + Catmull-Rom helpers,
+        # which is what keeps it identical to the widget and to the render.
+        if len(kfs) >= 2:
+            az_un = _unwrap_seq([kf[1] for kf in kfs])
+            els = [kf[2] for kf in kfs]
+            SUB = 24
+            prev = None
+            for seg in range(len(kfs) - 1):
+                for s in range(SUB + 1):
+                    u = s / SUB
+                    a = _wrap_deg(_seg_value(az_un, seg, u, smooth))
+                    e = _seg_value(els, seg, u, smooth)
+                    x1, y1, _ = pt(a, e)
+                    if prev is not None:
+                        d.line([prev[0], prev[1], x1, y1], fill=(95, 206, 128, 255),
+                               width=max(2, round(2.5 * k)))
+                    prev = (x1, y1)
+
+        for f_no, kaz, kel, kdist in kfs:
+            kx, ky, kfront = pt(kaz, kel)
+            distFk = _dist_scale(kdist)
+            kpx, kpy = cx + (kx - cx) * distFk, cy + (ky - cy) * distFk
+            dashed(kpx, kpy, kx, ky, dim((95, 206, 128), kfront), max(1, round(k)))
+            r3 = 3 * k
+            d.ellipse([kx - r3, ky - r3, kx + r3, ky + r3],
+                      outline=dim((190, 190, 200), kfront), width=max(1, round(k)))
+            rr = 10 * k
+            d.ellipse([kpx - rr, kpy - rr, kpx + rr, kpy + rr], fill=dim((95, 206, 128), kfront),
+                      outline=dim((255, 255, 255), kfront), width=max(2, round(2 * k)))
+            lab = str(f_no)
+            bb = d.textbbox((0, 0), lab, font=f_dot)
+            d.text((kpx - (bb[2] - bb[0]) / 2, kpy - (bb[3] - bb[1]) / 2 - bb[1]), lab,
+                   fill=(14, 20, 16, 255), font=f_dot)
+
+        label = (f"{len(kfs)} keyframes  f{kfs[0][0]}-{kfs[-1][0]}  "
+                 f"{'smooth' if smooth else 'linear'}")
+
+    d.text((8 * k, 6 * k), label, fill=(255, 255, 100, 255), font=f_txt)
     return np.asarray(img.convert("RGB"), dtype=np.uint8)
 
 
@@ -719,7 +785,9 @@ class CrossViewWarp:
         warp = np.stack(warp_frames, 0)  # [B,H,W,3] uint8
 
         warp_t = torch.from_numpy(warp.astype(np.float32) / 255.0)
-        orbit = _orbit_view_image(mid_az, mid_el, mid_dist)
+        # keyframed runs document the whole path; a static run documents the pose
+        orbit = _orbit_view_image(mid_az, mid_el, mid_dist,
+                                  kfs=kfs if keyframing else None, smooth=smooth_path)
         orbit_t = torch.from_numpy(orbit.astype(np.float32) / 255.0)[None]  # [1,H,W,3]
         return (warp_t, orbit_t)
 

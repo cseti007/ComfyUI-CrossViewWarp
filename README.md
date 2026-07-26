@@ -62,7 +62,7 @@ pip install numba
 | Output | What it is |
 |---|---|
 | `warp` | the warp control video — wire to an IC-LoRA reference guide (`latent_downscale_factor = 1`) |
-| `orbit_view` | a rendered image of the orbit sphere with your camera setup — wire to a PreviewImage/SaveImage to document what you asked for |
+| `orbit_view` | a rendered image of the orbit sphere with your camera setup — the single pose, or the whole keyframed path with its frame-numbered markers — wire to a PreviewImage/SaveImage to document what you asked for |
 
 Key inputs (all have tooltips in the UI):
 
