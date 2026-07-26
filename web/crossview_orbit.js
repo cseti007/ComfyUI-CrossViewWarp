@@ -28,6 +28,9 @@ const C_GREEN = [80, 200, 120], C_YELLOW = [230, 200, 90], C_RED = [225, 95, 95]
 const SNAP_DEG = 5;
 const HANDLE_R = 14;
 const WIDGET_H = 304;
+// Upper bound for the auto-grown globe (see globeH below) so a very wide node
+// cannot turn the widget into a full-screen canvas.
+const GLOBE_H_MAX = 700;
 // Frames added per newly placed keyframe. The widget cannot know the clip
 // length (only the node sees it at execution), so new keyframes are spaced a
 // second apart at 24fps and the frame numbers stay editable in the widget.
@@ -444,7 +447,10 @@ class OrbitEditor {
       if (kfIdx >= 0) {
         this.drag = "kf";
         this.dragKf = kfIdx;
-      } else if (this.snapPts && this.snapPts.some(([sxp, syp]) => Math.hypot(x - sxp, y - syp) < 12)) {
+      } else if (!this.useKeyframes && this.snapPts &&
+                 this.snapPts.some(([sxp, syp]) => Math.hypot(x - sxp, y - syp) < 12)) {
+        // snap dots write azimuth/elevation, which are inert while a keyframed
+        // move is running — so they only respond in static mode
         const [sxp, syp, a, e] = this.snapPts.find(([sxp2, syp2]) => Math.hypot(x - sxp2, y - syp2) < 12);
         const wA = getW(this.node, "azimuth"), wE = getW(this.node, "elevation");
         if (wA) wA.value = a;
@@ -594,41 +600,53 @@ class OrbitEditor {
       ctx.globalAlpha = 1.0;
     }
 
-    // arc home -> camera
-    ctx.strokeStyle = "#78beff"; ctx.lineWidth = 2.5;
-    ctx.beginPath();
-    for (let i = 0; i <= 14; i++) {
-      const [ax, ay] = P((az * i) / 14, (el * i) / 14);
-      i ? ctx.lineTo(ax, ay) : ctx.moveTo(ax, ay);
-    }
-    ctx.stroke();
+    // The blue camera handle visualises the STATIC azimuth/elevation/distance,
+    // which do nothing once a keyframed move is running (those widgets are
+    // hidden then). Drawing it anyway left two markers for one camera, with the
+    // blue one sitting under the green frame-0 marker it was seeded from. So in
+    // keyframe mode the whole static-camera overlay is skipped and the green
+    // path is the only camera indicator.
+    if (!this.useKeyframes) {
+      // arc home -> camera
+      ctx.strokeStyle = "#78beff"; ctx.lineWidth = 2.5;
+      ctx.beginPath();
+      for (let i = 0; i <= 14; i++) {
+        const [ax, ay] = P((az * i) / 14, (el * i) / 14);
+        i ? ctx.lineTo(ax, ay) : ctx.moveTo(ax, ay);
+      }
+      ctx.stroke();
 
-    // camera handle at distance-scaled radius: the sphere is the 1.0x reference
-    // shell; dist<1 pulls the camera INSIDE (closer to the subject), dist>1
-    // pushes it OUTSIDE. Mouse wheel = dolly (industry standard).
-    const distF = distScale(dist);
-    const [sx, sy, pf] = P(az, el);           // on-shell point (direction)
-    const px = g.cx + (sx - g.cx) * distF;
-    const py = g.cy + (sy - g.cy) * distF;
-    // faint dolly ray: subject -> out past the shell, with a tick at 1.0x
-    ctx.strokeStyle = "rgba(120,190,255,0.35)"; ctx.lineWidth = 1;
-    ctx.setLineDash([4, 4]);
-    ctx.beginPath(); ctx.moveTo(g.cx, g.cy);
-    ctx.lineTo(g.cx + (sx - g.cx) * 1.32, g.cy + (sy - g.cy) * 1.32); ctx.stroke();
-    ctx.setLineDash([]);
-    ctx.strokeStyle = "rgba(255,255,255,0.6)";
-    ctx.beginPath(); ctx.arc(sx, sy, 3, 0, Math.PI * 2); ctx.stroke();  // 1.0x tick
-    this.handle = [px, py];
-    ctx.globalAlpha = pf < 0 ? 1.0 : 0.45;
-    ctx.strokeStyle = "#78beff"; ctx.lineWidth = 1;
-    for (const [dx, dy] of [[-8, -6], [8, -6], [-8, 6], [8, 6]]) {
-      ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(g.cx + dx, g.cy + dy - 6); ctx.stroke();
+      // camera handle at distance-scaled radius: the sphere is the 1.0x reference
+      // shell; dist<1 pulls the camera INSIDE (closer to the subject), dist>1
+      // pushes it OUTSIDE. Mouse wheel = dolly (industry standard).
+      const distF = distScale(dist);
+      const [sx, sy, pf] = P(az, el);           // on-shell point (direction)
+      const px = g.cx + (sx - g.cx) * distF;
+      const py = g.cy + (sy - g.cy) * distF;
+      // faint dolly ray: subject -> out past the shell, with a tick at 1.0x
+      ctx.strokeStyle = "rgba(120,190,255,0.35)"; ctx.lineWidth = 1;
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath(); ctx.moveTo(g.cx, g.cy);
+      ctx.lineTo(g.cx + (sx - g.cx) * 1.32, g.cy + (sy - g.cy) * 1.32); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.strokeStyle = "rgba(255,255,255,0.6)";
+      ctx.beginPath(); ctx.arc(sx, sy, 3, 0, Math.PI * 2); ctx.stroke();  // 1.0x tick
+      this.handle = [px, py];
+      ctx.globalAlpha = pf < 0 ? 1.0 : 0.45;
+      ctx.strokeStyle = "#78beff"; ctx.lineWidth = 1;
+      for (const [dx, dy] of [[-8, -6], [8, -6], [-8, 6], [8, 6]]) {
+        ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(g.cx + dx, g.cy + dy - 6); ctx.stroke();
+      }
+      ctx.fillStyle = "#78beff"; ctx.strokeStyle = "#fff"; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.roundRect(px - 13, py - 9, 26, 18, 4); ctx.fill(); ctx.stroke();
+      ctx.fillStyle = "#20242c";
+      ctx.beginPath(); ctx.arc(px + 5, py, 3.5, 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = 1.0;
+    } else {
+      // no static handle on screen -> nothing for onDown() to grab, otherwise
+      // the last drawn position would stay draggable while invisible
+      this.handle = null;
     }
-    ctx.fillStyle = "#78beff"; ctx.strokeStyle = "#fff"; ctx.lineWidth = 2;
-    ctx.beginPath(); ctx.roundRect(px - 13, py - 9, 26, 18, 4); ctx.fill(); ctx.stroke();
-    ctx.fillStyle = "#20242c";
-    ctx.beginPath(); ctx.arc(px + 5, py, 3.5, 0, Math.PI * 2); ctx.fill();
-    ctx.globalAlpha = 1.0;
 
     // --- keyframe markers (S+click): green dots joined by a green arc that
     // mirrors the blue home->camera arc above. The arc is walked segment by
@@ -716,13 +734,28 @@ app.registerExtension({
         canvas.style.cursor = "grab";
         container.appendChild(canvas);
 
-        node.addDOMWidget("orbit", "crossviewOrbitWidget", container, {
+        // geom() sizes the sphere from min(canvasW, canvasH). The canvas width
+        // already follows the node, but with the height pinned at WIDGET_H the
+        // globe stopped growing as soon as the node was wider than that. Letting
+        // the height track the node width keeps the canvas roughly square, so
+        // widening the node actually enlarges the globe; clamped at both ends so
+        // it can neither collapse nor run away.
+        const globeH = () => Math.round(
+          Math.max(WIDGET_H, Math.min(GLOBE_H_MAX, (node.size?.[0] ?? 360) * 0.85)));
+
+        const orbitWidget = node.addDOMWidget("orbit", "crossviewOrbitWidget", container, {
           serialize: false,
           hideOnZoom: false,
-          getMinHeight: () => WIDGET_H,
-          getMaxHeight: () => WIDGET_H,
-          getHeight: () => WIDGET_H,
+          getMinHeight: globeH,
+          getMaxHeight: globeH,
+          getHeight: globeH,
         });
+        // The options object above only reaches widget.options.serialize, but
+        // litegraph's serialize()/configure() check widget.serialize — so this
+        // canvas was being written into widgets_values as a stray "". Harmless
+        // on its own, but it shifts every value added after it: workflows saved
+        // before this fix carry one extra trailing entry.
+        if (orbitWidget) orbitWidget.serialize = false;
         node._crossviewOrbit = new OrbitEditor(node, canvas);
 
         // While a keyframed move is active the static azimuth/elevation/distance
@@ -744,9 +777,13 @@ app.registerExtension({
             if (w.options) w.options.hidden = active;
             changed = true;
           }
-          // Only resize when something actually changed — computeSize() on every
-          // frame would fight the user resizing the node by hand.
-          if (changed) node.setSize(node.computeSize());
+          // Deliberately NO setSize/computeSize here. computeSize() returns the
+          // node's minimum layout size, so calling it on a visibility change threw
+          // away a manual resize: the node snapped smaller and jumped, which looked
+          // like it was tearing its own links off. Repainting is enough — the
+          // frontend lays hidden widgets out on its own; worst case a small gap is
+          // left where they were.
+          if (changed) node.setDirtyCanvas(true, true);
         };
         node._crossviewSyncHidden();
         node.setSize(node.computeSize());
