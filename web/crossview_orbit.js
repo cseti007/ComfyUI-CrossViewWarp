@@ -116,6 +116,27 @@ function isAutoTimed(kfs, count) {
   return kfs.every((k, i) => k.f === want[i]);
 }
 
+// Refit an existing path onto a clip of `count` frames: the first keyframe moves
+// to 1, the last to `count`, and the ones between keep their relative spacing.
+//
+// This runs when frame_count CHANGES, and it is what makes the setting usable at
+// all. isAutoTimed() alone cannot do it: any path that does not match the current
+// formula reads as hand-edited, so keyframes placed before frame_count was set
+// (or by an older version numbering from 0) would never line up with the clip
+// again. Rescaling is also the honest answer for a hand-timed path — the rhythm
+// the user authored is preserved, just fitted to the new length.
+function rescaleFrames(kfs, count) {
+  if (kfs.length < 2 || count < 2) return false;
+  const first = kfs[0].f, span = kfs[kfs.length - 1].f - first;
+  const want = kfs.map((k, i) => (span > 0
+    ? 1 + Math.round(((k.f - first) * (count - 1)) / span)
+    : 1 + Math.round((i * (count - 1)) / (kfs.length - 1))));
+  // a clip too short to hold them all as distinct frames is left alone
+  if (new Set(want).size !== want.length) return false;
+  kfs.forEach((k, i) => { k.f = want[i]; });
+  return true;
+}
+
 function round1(v) { return Math.round(Number(v) * 10) / 10; }
 function round2(v) { return Math.round(Number(v) * 100) / 100; }
 
@@ -328,17 +349,59 @@ class OrbitEditor {
     this._lastKfRaw = getW(this.node, "keyframes")?.value;
     this.kfs = parseKfs(this._lastKfRaw);
     this._lastKfCount = this.kfs.length;
+    // Remember the starting frame_count without acting on it: rescaling belongs
+    // to a deliberate change during the session, not to merely opening a
+    // workflow, which would rewrite a saved path every time it is loaded.
+    this._lastFrames = Math.round(getW(this.node, "frame_count")?.value ?? 0);
+  }
+  // Where the `keyframes` value comes from. Once the widget is converted to an
+  // input, the node executes with whatever the upstream sends and our local
+  // widget value is a leftover — editing the sphere would then show a path that
+  // is not the one rendered. So: report that it is linked, and resolve the value
+  // when it is knowable. A literal upstream (primitive / string constant) carries
+  // the text in one of its own widgets; try each and take the first that parses.
+  // A computed upstream only produces its string on the server at execution time,
+  // so there is genuinely nothing to preview — say so rather than show a stale
+  // local value.
+  _keyframeSource() {
+    const inp = this.node.inputs?.find((i) => i.widget?.name === "keyframes");
+    if (inp?.link == null) return { linked: false, kfs: null };
+    const graph = this.node.graph || app.graph;
+    const link = graph?.links?.[inp.link];
+    const src = link ? graph.getNodeById?.(link.origin_id) : null;
+    for (const w of src?.widgets ?? []) {
+      if (typeof w.value !== "string") continue;
+      const kfs = parseKfs(w.value);
+      if (kfs.length) return { linked: true, kfs };
+    }
+    return { linked: true, kfs: null };
   }
   // Re-read the widgets every frame so hand-edits to the `keyframes` string and
   // the interpolation / use_keyframes toggles show up on the sphere.
   _syncFromWidgets() {
-    const raw = getW(this.node, "keyframes")?.value;
-    if (raw !== this._lastKfRaw) {
-      this._lastKfRaw = raw;
-      this.kfs = parseKfs(raw);
-      // a hand-edit is as authoritative as a click, so the threshold tracker
-      // must follow it too
-      this._lastKfCount = this.kfs.length;
+    const src = this._keyframeSource();
+    this.linked = src.linked;
+    this.linkedUnknown = src.linked && src.kfs === null;
+    if (src.linked) {
+      // driven from outside: mirror what we can resolve, never our own leftover
+      this.kfs = src.kfs ?? [];
+    } else {
+      const raw = getW(this.node, "keyframes")?.value;
+      if (raw !== this._lastKfRaw) {
+        this._lastKfRaw = raw;
+        this.kfs = parseKfs(raw);
+        // a hand-edit is as authoritative as a click, so the threshold tracker
+        // must follow it too
+        this._lastKfCount = this.kfs.length;
+      }
+      // A changed frame_count refits the path onto the new clip length. Only on
+      // an actual change, so it never fights a hand-edited path that the user is
+      // not currently retargeting.
+      const frames = Math.round(getW(this.node, "frame_count")?.value ?? 0);
+      if (frames !== this._lastFrames) {
+        this._lastFrames = frames;
+        if (frames > 1 && rescaleFrames(this.kfs, frames)) this._writeKfWidgets();
+      }
     }
     const sm = getW(this.node, "interpolation")?.value;
     if (typeof sm === "string") this.smoothPath = sm === "smooth";
@@ -374,6 +437,9 @@ class OrbitEditor {
     this.node.setDirtyCanvas(true, true);
   }
   onKeyframeClick(x, y) {
+    // driven by an upstream node -> the sphere is a preview, not an editor;
+    // writing here would show a path the node will not actually render
+    if (this.linked) return;
     const g = this.geom();
     const ae = this.view.unproject(x - g.cx, y - g.cy, g.R);
     if (!ae) return;                       // missed the sphere disc entirely
@@ -473,7 +539,7 @@ class OrbitEditor {
     } else {
       // grab the nearest keyframe marker to drag it. Left button only; right-click
       // still routes through onKeyframeClick (place/delete).
-      const kfIdx = this.pickKf(x, y, 20);
+      const kfIdx = this.linked ? -1 : this.pickKf(x, y, 20);
       if (kfIdx >= 0) {
         this.drag = "kf";
         this.dragKf = kfIdx;
@@ -540,7 +606,7 @@ class OrbitEditor {
 
     // Hovering a keyframe dollies THAT keyframe; anywhere else dollies the
     // static camera. Both use the drawn marker position (see pickKf).
-    const idx = this.pickKf(mx, my, 22);
+    const idx = this.linked ? -1 : this.pickKf(mx, my, 22);
     if (idx >= 0) {
       const kf = this.kfs[idx];
       kf.dist = clampDist(kf.dist + step);
@@ -578,7 +644,7 @@ class OrbitEditor {
     this._syncFromWidgets();
     const { az, el, dist } = this.vals();
     const g = this.geom();
-    const kfKey = `${this.kfs.map((k) => `${k.f},${k.az.toFixed(1)},${k.el.toFixed(1)},${k.dist.toFixed(2)}`).join(";")}|${this.smoothPath ? 1 : 0}|${this.useKeyframes ? 1 : 0}`;
+    const kfKey = `${this.kfs.map((k) => `${k.f},${k.az.toFixed(1)},${k.el.toFixed(1)},${k.dist.toFixed(2)}`).join(";")}|${this.smoothPath ? 1 : 0}|${this.useKeyframes ? 1 : 0}|${this.linked ? 1 : 0}${this.linkedUnknown ? "?" : ""}`;
     const key = `${az}|${el}|${dist}|${this.view.viewYaw.toFixed(3)}|${this.view.viewTilt.toFixed(3)}|${kfKey}|${this.canvas.width}x${this.canvas.height}`;
     if (!force && key === this._renderKey) return;
     this._renderKey = key;
@@ -740,12 +806,18 @@ class OrbitEditor {
     // edits in the keyframes widget.
     this.kfPos = this.kfs.map((kf) => drawKf(kf, String(kf.f)));
 
-    // A right-click gesture is not discoverable on its own, so say so — but only
-    // until the first keyframe exists, after which the hint has done its job.
-    if (!this.kfs.length) {
-      ctx.fillStyle = "rgba(200,204,216,0.45)";
+    // Status line. When `keyframes` is wired from another node the sphere cannot
+    // be edited, and if that node computes its string at execution time there is
+    // nothing to preview either — better to admit that than to leave a confident
+    // but wrong picture on screen. Otherwise the right-click hint, which retires
+    // once the first keyframe exists.
+    let hint = null;
+    if (this.linkedUnknown) hint = "keyframes: driven by input (value known at run time)";
+    else if (this.linked) hint = "keyframes: driven by input - preview only";
+    else if (!this.kfs.length) hint = "right-click: add camera keyframe";
+    if (hint) {
+      ctx.fillStyle = this.linkedUnknown ? "rgba(230,200,90,0.75)" : "rgba(200,204,216,0.45)";
       ctx.font = "11px monospace";
-      const hint = "right-click: add camera keyframe";
       ctx.fillText(hint, (W - ctx.measureText(hint).width) / 2, H - 8);
     }
   }

@@ -130,6 +130,20 @@ re-applied, so your timing survives further edits on the sphere. Leave
 `frame_count` at 0 and new keyframes are simply placed 24 frames apart, as the
 widget has no way of knowing the clip length on its own.
 
+Changing `frame_count` refits the existing path onto the new length: the first
+keyframe moves to 1, the last to the new final frame, and the ones between keep
+their relative spacing. So it also works the other way round — place keyframes
+first, then type the clip length, and they stretch to fit.
+
+### Feeding `keyframes` from another node
+
+Convert `keyframes` to an input and the sphere becomes read-only: the node will
+render whatever the upstream sends, so letting you edit markers here would show a
+path that is not the one produced. If the upstream is a literal (a primitive or
+string-constant node) the sphere previews its path; if the string is computed at
+execution time there is nothing to preview, and the sphere says so rather than
+leaving a stale local path on screen.
+
 Two options shape the result:
 
 - `interpolation` — `linear` gives straight legs with a corner at each keyframe;
