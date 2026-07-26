@@ -82,14 +82,44 @@ Key inputs (all have tooltips in the UI):
 
 ### Keyframed camera move (S + click)
 
-Hold **S** and click on the orbit sphere to place keyframe markers **A** (frame
-0), **B** (last frame), and optionally **C** . Drag a marker to move
-it, **hover a marker and scroll the mouse wheel to change its distance**,
-S+click an existing marker to delete it. Placing A and B auto-enables
-`use_keyframes`; toggling it off leaves the markers visible but dimmed to 20%,
-so you can see the setup without it being active. Two points (A+B) give a
-linear move; adding C bends the path through B (with `abc_smooth` you can round
-the corner into a Bezier).
+Hold **S** and click on the orbit sphere to place a camera keyframe. The first
+click also captures your current azimuth/elevation/distance as the starting
+keyframe, so one click gives you a complete move. Drag a marker to move it,
+hover it and scroll the wheel to dolly it, S+click it to delete it. Each marker
+is labelled with its **frame number**.
+
+Placing a second keyframe enables `use_keyframes` and hides the static
+azimuth/elevation/distance (they do nothing while a move is running, and come
+back when you clear the path). Toggling `use_keyframes` off leaves the markers
+visible but dimmed, so you can compare against the static pose without losing
+the setup.
+
+The path itself lives in the `keyframes` widget as JSON, and you can edit it by
+hand — which is currently the way to fine-tune the timing:
+
+```json
+[{"f":0,"az":-30,"el":20,"dist":1.0},{"f":48,"az":45,"el":10,"dist":1.2}]
+```
+
+`f` is an absolute frame number. Before the first and after the last keyframe
+the camera **holds**, so a path may cover only part of the clip — "swing for the
+first two seconds, then sit still" is just a path that ends early. A keyframe
+past the end of the clip is an error rather than a silently truncated move, so a
+path authored for a longer clip tells you instead of quietly doing the wrong
+thing.
+
+New keyframes are placed 24 frames apart, since the widget cannot know the
+clip's length or frame rate — retime them in the widget as needed.
+
+Two options shape the result:
+
+- `interpolation` — `linear` gives straight legs with a corner at each keyframe;
+  `smooth` runs a Catmull-Rom spline through them (still passing exactly through
+  every keyframe). With only two keyframes the two are identical.
+- `interp_motion` — timing between consecutive keyframes. Applied per segment,
+  so `ease_in_out` settles the camera into every keyframe. Pair easing with
+  `linear`; combining it with `smooth` cancels the very continuity the spline
+  is there to provide.
 
 ## Generation settings that worked for me
 
