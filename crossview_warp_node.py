@@ -12,6 +12,8 @@ it was trained on. Depth is normalised globally across the clip for temporal
 consistency and re-centred so an off-centre subject stays framed.
 """
 
+import json
+
 import numpy as np
 import torch
 
@@ -68,7 +70,10 @@ def _orbit_view_image(azimuth, elevation, distance, size=512):
     k = size / 300.0                     # widget geometry is authored at ~300px height
     S = min(W - 16 * k, H - 12 * k)
     cx, cy = W / 2.0, H / 2.0
-    R = (S / 2.0 - 4 * k) * 0.76
+    # 0.62 (not 0.76) so the camera handle still fits when _dist_scale reaches
+    # 1.5R at dist=3.0 -- must stay in step with geom() in web/crossview_orbit.js,
+    # which this function is a 1:1 port of.
+    R = (S / 2.0 - 4 * k) * 0.62
     yaw, tilt = 0.24, 0.20               # widget default view
 
     ZONE_GREEN, ZONE_YELLOW = (45, 30, 15), (65, 40, 25)
@@ -307,37 +312,137 @@ def _ease(t, mode):
     return t   # "linear" / unknown -> identity
 
 
-def _interp_value(a, b, t, mode):
-    return a + (b - a) * _ease(t, mode)
+def _unwrap_seq(degs):
+    """Unwrap a sequence of angles so each step takes the short way round.
+
+    Interpolating in unwrapped space is what keeps a move across the +-180 seam
+    continuous (170 -> -170 becomes 170 -> 190); the result is wrapped back at
+    the end."""
+    out = [float(degs[0])]
+    for d in degs[1:]:
+        out.append(out[-1] + _wrap_deg(float(d) - out[-1]))
+    return out
 
 
-def _interp_angle(a_deg, b_deg, t, mode):
-    """Shortest-path interpolation on the azimuth circle (handles the seam at +-180)."""
-    diff = _wrap_deg(b_deg - a_deg)
-    return _wrap_deg(a_deg + diff * _ease(t, mode))
+def _catmull(p0, p1, p2, p3, u):
+    """Uniform Catmull-Rom segment: passes through p1 at u=0 and p2 at u=1.
+
+    Chosen over a Bezier because it INTERPOLATES its control points -- every
+    keyframe is hit exactly -- and it generalises to any number of points,
+    unlike a quadratic Bezier which only lands on the middle point via a
+    hand-fitted control point."""
+    return 0.5 * ((2.0 * p1)
+                  + (-p0 + p2) * u
+                  + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * u * u
+                  + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * u * u * u)
 
 
-def _interp_abc(a, b, c, t, smooth):
-    """Three-point scalar interpolation. smooth=True uses a quadratic Bezier
-    whose control point pc = 2*b - 0.5*(a+c) makes the curve pass through b
-    at t=0.5; smooth=False is piecewise linear a->b->c. Both hit a/b/c at
-    t=0/0.5/1."""
-    if smooth:
-        pc = 2.0 * b - 0.5 * (a + c)
-        mt = 1.0 - t
-        return mt * mt * a + 2.0 * mt * t * pc + t * t * c
-    if t <= 0.5:
-        return a + (b - a) * (t / 0.5)
-    return b + (c - b) * ((t - 0.5) / 0.5)
+def _seg_value(vals, seg, u, smooth):
+    """Value between vals[seg] and vals[seg+1] at local position u in [0,1].
+
+    smooth=False is a straight lerp. smooth=True is Catmull-Rom, which needs the
+    two neighbouring points; at the ends they are reflected so the curve keeps
+    its tangent instead of flattening. With only two keyframes Catmull-Rom is
+    identical to the lerp, so the simple case is unaffected."""
+    p1, p2 = vals[seg], vals[seg + 1]
+    if not smooth or len(vals) < 3:
+        return p1 + (p2 - p1) * u
+    p0 = vals[seg - 1] if seg > 0 else p1 + (p1 - p2)
+    p3 = vals[seg + 2] if seg + 2 < len(vals) else p2 + (p2 - p1)
+    return _catmull(p0, p1, p2, p3, u)
 
 
-def _interp_abc_angle(a_deg, b_deg, c_deg, t, smooth):
-    """Three-point angle interp: unwrap b then c relative to the running
-    tangent so the Bezier control-point math stays continuous across the
-    +-180 seam, then wrap the result back to (-180, 180]."""
-    b_unwrap = a_deg + _wrap_deg(b_deg - a_deg)
-    c_unwrap = b_unwrap + _wrap_deg(c_deg - b_unwrap)
-    return _wrap_deg(_interp_abc(a_deg, b_unwrap, c_unwrap, t, smooth))
+def _parse_keyframes(raw, frame_count):
+    """Parse the `keyframes` widget into a sorted [(frame, az, el, dist), ...].
+
+    Empty input means "no camera move". Anything malformed raises ValueError with
+    a message written for the user: a silently truncated or misread camera move is
+    worse than a failed queue, and every bug class this format replaced was of the
+    silently-wrong kind."""
+    if raw is None:
+        return []
+    raw = str(raw).strip()
+    if not raw or raw in ("[]", "null"):
+        return []
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "CrossViewWarp: 'keyframes' is not valid JSON (%s). Expected something like "
+            '[{"f":0,"az":-30,"el":20,"dist":1.0},{"f":48,"az":45,"el":10,"dist":1.2}]' % exc
+        ) from None
+    if not isinstance(data, list):
+        raise ValueError("CrossViewWarp: 'keyframes' must be a JSON list of keyframe objects.")
+
+    out = []
+    for i, kf in enumerate(data):
+        if not isinstance(kf, dict):
+            raise ValueError("CrossViewWarp: keyframe #%d is not an object." % i)
+        try:
+            f = int(round(float(kf["f"])))
+            az, el, dist = float(kf["az"]), float(kf["el"]), float(kf["dist"])
+        except (KeyError, TypeError, ValueError):
+            raise ValueError(
+                "CrossViewWarp: keyframe #%d needs numeric 'f', 'az', 'el' and 'dist'." % i
+            ) from None
+        if f < 0:
+            raise ValueError("CrossViewWarp: keyframe #%d has a negative frame (%d)." % (i, f))
+        if f > frame_count - 1:
+            raise ValueError(
+                "CrossViewWarp: keyframe #%d sits at frame %d, but this clip only has %d frames "
+                "(last index %d). The camera path was authored for a longer clip -- move that "
+                "keyframe, or feed a longer clip." % (i, f, frame_count, frame_count - 1))
+        out.append((f, az, el, dist))
+
+    out.sort(key=lambda k: k[0])
+    seen = [k[0] for k in out]
+    if len(set(seen)) != len(seen):
+        raise ValueError("CrossViewWarp: two keyframes share the same frame number.")
+    return out
+
+
+def _prepare_path(kfs):
+    """Pre-split the keyframe list into the arrays the sampler reads (done once,
+    not per frame). Azimuth is unwrapped here so every segment lookup stays cheap."""
+    return {
+        "f": [k[0] for k in kfs],
+        "az": _unwrap_seq([k[1] for k in kfs]),
+        "el": [k[2] for k in kfs],
+        "dist": [k[3] for k in kfs],
+    }
+
+
+def _sample_path(path, frame, easing, smooth):
+    """Camera pose (az, el, dist) at an absolute frame index.
+
+    Outside the keyframed span the pose is HELD rather than extrapolated, so a
+    path covering only part of the clip simply stops moving -- that is what makes
+    "swing for the first half, then hold" expressible at all.
+
+    Easing is applied per segment, so it reads as a deceleration into each
+    keyframe; combine it with interpolation='linear'. For one continuous flowing
+    move use interpolation='smooth' with easing 'linear', otherwise the eased
+    stop at every knot cancels the smoothing the spline exists to provide."""
+    fs = path["f"]
+    if frame <= fs[0]:
+        return path["az"][0], path["el"][0], path["dist"][0]
+    if frame >= fs[-1]:
+        return path["az"][-1], path["el"][-1], path["dist"][-1]
+
+    seg = 0
+    for i in range(len(fs) - 1):
+        if fs[i] <= frame <= fs[i + 1]:
+            seg = i
+            break
+    u = _ease((frame - fs[seg]) / float(fs[seg + 1] - fs[seg]), easing)
+
+    # Catmull-Rom overshoots between points, so clamp what has a physical limit:
+    # past +-90 elevation the camera tips over the pole, and a distance <= 0 puts
+    # the eye on the far side of the pivot.
+    az = _wrap_deg(_seg_value(path["az"], seg, u, smooth))
+    el = float(np.clip(_seg_value(path["el"], seg, u, smooth), -90.0, 90.0))
+    dist = float(np.clip(_seg_value(path["dist"], seg, u, smooth), 0.2, 3.0))
+    return az, el, dist
 
 
 def _orbit_C_tgt(az_deg, el_deg, dist, pivot):
@@ -418,53 +523,28 @@ class CrossViewWarp:
                 # middle shifts every downstream value into the wrong slot and
                 # breaks previously saved nodes on load.
                 "use_keyframes": ("BOOLEAN", {"default": False,
-                    "tooltip": "Enable the two-point camera move (A at frame 0 -> B at the last "
-                    "frame), interpolated per-frame following 'interp'. When OFF, the single "
-                    "azimuth/elevation/distance above is applied to every frame. Use S+click on "
-                    "the orbit sphere to set A and B visually."}),
-                "A_azimuth": ("FLOAT", {"default": -30.0, "min": -180.0, "max": 180.0, "step": 1.0,
-                    "tooltip": "Keyframe A: camera azimuth at frame 0 (deg). Hidden in the UI - "
-                    "set it with S+click on the sphere. (Right-click the node to unhide.)"}),
-                "A_elevation": ("FLOAT", {"default": 20.0, "min": -90.0, "max": 90.0, "step": 1.0,
-                    "tooltip": "Keyframe A: camera elevation at frame 0 (deg). Hidden in the UI - "
-                    "set it with S+click on the sphere. (Right-click the node to unhide.)"}),
-                "A_distance": ("FLOAT", {"default": 1.0, "min": 0.2, "max": 3.0, "step": 0.05,
-                    "tooltip": "Keyframe A: camera distance at frame 0 (1.0 = source distance). "
-                    "Drag this slider to push/pull the green A marker along its current direction."}),
-                "B_azimuth": ("FLOAT", {"default": 30.0, "min": -180.0, "max": 180.0, "step": 1.0,
-                    "tooltip": "Keyframe B: camera azimuth at the LAST frame (deg). Hidden in the "
-                    " UI - set it with S+click on the sphere. (Right-click the node to unhide.)"}),
-                "B_elevation": ("FLOAT", {"default": 20.0, "min": -90.0, "max": 90.0, "step": 1.0,
-                    "tooltip": "Keyframe B: camera elevation at the last frame (deg). Hidden in "
-                    "the UI - set it with S+click on the sphere. (Right-click the node to unhide.)"}),
-                "B_distance": ("FLOAT", {"default": 1.0, "min": 0.2, "max": 3.0, "step": 0.05,
-                    "tooltip": "Keyframe B: camera distance at the last frame (1.0 = source "
-                    "distance). Drag this slider to push/pull the green B marker along its "
-                    "current direction."}),
-                "C_azimuth": ("FLOAT", {"default": 0.0, "min": -180.0, "max": 999.0, "step": 1.0,
-                    "tooltip": "Keyframe C: camera azimuth at the midpoint frame (deg). Hidden "
-                    "in the UI - set it with S+click on the sphere. (Right-click the node to "
-                    "unhide.) 999.0 is the 'no C placed' sentinel - max is 999 instead of 180 "
-                    "only so this sentinel passes ComfyUI's input validation; the runtime clamps "
-                    "real values back to the +-180 legal range."}),
-                "C_elevation": ("FLOAT", {"default": 0.0, "min": -90.0, "max": 90.0, "step": 1.0,
-                    "tooltip": "Keyframe C: camera elevation at the midpoint frame (deg). Hidden "
-                    "in the UI - set it with S+click on the sphere. (Right-click the node to "
-                    "unhide.)"}),
-                "C_distance": ("FLOAT", {"default": 1.0, "min": 0.2, "max": 3.0, "step": 0.05,
-                    "tooltip": "Keyframe C: camera distance at the midpoint frame (1.0 = source "
-                    "distance). Drag this slider to push/pull the green C marker along its "
-                    "current direction."}),
+                    "tooltip": "Animate the camera along the 'keyframes' path instead of holding "
+                    "one pose. When OFF, the single azimuth/elevation/distance above is applied to "
+                    "every frame. Place keyframes with S+click on the orbit sphere."}),
+                "keyframes": ("STRING", {"default": "", "multiline": False,
+                    "tooltip": "Camera path as JSON, written by S+click on the orbit sphere - you "
+                    "normally never type in here. Each entry is one keyframe: 'f' = frame number, "
+                    "'az'/'el' = angles in degrees, 'dist' = distance (1.0 = source). Example: "
+                    '[{"f":0,"az":-30,"el":20,"dist":1.0},{"f":48,"az":45,"el":10,"dist":1.2}] . '
+                    "Before the first and after the last keyframe the pose is held, so a path may "
+                    "cover only part of the clip. Empty = no move."}),
                 "interp_motion": (["linear", "ease_in_out", "ease_in", "ease_out"], {"default": "linear",
-                    "tooltip": "Curve used to interpolate between keyframe A and B across the "
-                    "video frames. linear = constant angular speed; ease_in_out = slow start & "
-                    "end (cinematic); ease_in / ease_out = one-sided. Only used when 'use_keyframes' "
+                    "tooltip": "Timing between consecutive keyframes. linear = constant speed; "
+                    "ease_in_out = slow start & end (applied per segment, so the camera settles "
+                    "into every keyframe); ease_in / ease_out = one-sided. Pair easing with "
+                    "interpolation='linear' - with 'smooth' it cancels the very continuity the "
+                    "spline provides. Only used when 'use_keyframes' is ON."}),
+                "interpolation": (["linear", "smooth"], {"default": "linear",
+                    "tooltip": "Shape of the path through the keyframes. linear = straight legs "
+                    "with a corner at each keyframe. smooth = Catmull-Rom spline that glides "
+                    "through them with no corner (still passes exactly through every keyframe). "
+                    "With only two keyframes the two are identical. Only used when 'use_keyframes' "
                     "is ON."}),
-                "abc_smooth": ("BOOLEAN", {"default": False,
-                    "tooltip": "Path shape through keyframes A/B/C. OFF (default) = "
-                    "piecewise linear A->B->C (constant angular speed per leg, corner at "
-                    "B). ON = quadratic Bezier that glides through B with no corner. Only "
-                    "used when 'use_keyframes' is ON and C is placed."}),
             },
         }
 
@@ -481,11 +561,7 @@ class CrossViewWarp:
 
     def build(self, frames, depth, azimuth, elevation, distance, hfov, head_bias, depth_ratio, smooth_depth, invert_depth,
               roll_lock=True, pivot_override=True, pivot_x=0.0, pivot_y=0.0, pivot_z=1.05,
-              interp_motion="linear", use_keyframes=False,
-              A_azimuth=-30.0, A_elevation=20.0, A_distance=1.0,
-              B_azimuth=30.0, B_elevation=20.0, B_distance=1.0,
-              C_azimuth=0.0, C_elevation=0.0, C_distance=1.0,
-              abc_smooth=False):
+              use_keyframes=False, keyframes="", interp_motion="linear", interpolation="linear"):
         # frames: [B,H,W,C] float [0,1]; depth: [B,H,W,C] brightness [0,1]
         rgb = (frames.clamp(0, 1).cpu().numpy() * 255.0).astype(np.uint8)   # [B,H,W,3]
         B, H, W = rgb.shape[:3]
@@ -530,20 +606,15 @@ class CrossViewWarp:
         # For a single-pose run this is just (az, el, dist); for a keyframed
         # run we use the move's midpoint so the upright correction is the
         # average of where the camera actually lives across the clip.
-        keyframing = bool(use_keyframes and B > 1)
-        # "C exists" is signalled by a sentinel value the JS writes into
-        # C_azimuth whenever kfC is null: 999.0 is outside the legal +-180
-        # range, so an in-range C_azimuth means C has been placed.
-        use_c_path = keyframing and abs(C_azimuth) <= 180.0
-        smooth_abc = bool(abc_smooth)
-        if use_c_path:
-            mid_az = _interp_abc_angle(A_azimuth, B_azimuth, C_azimuth, 0.5, smooth_abc)
-            mid_el = _interp_abc(A_elevation, B_elevation, C_elevation, 0.5, smooth_abc)
-            mid_dist = _interp_abc(A_distance, B_distance, C_distance, 0.5, smooth_abc)
-        elif keyframing:
-            mid_az = _interp_angle(A_azimuth, B_azimuth, 0.5, interp_motion)
-            mid_el = _interp_value(A_elevation, B_elevation, 0.5, interp_motion)
-            mid_dist = _interp_value(A_distance, B_distance, 0.5, interp_motion)
+        kfs = _parse_keyframes(keyframes, B) if use_keyframes else []
+        path = _prepare_path(kfs) if kfs else None
+        keyframing = bool(len(kfs) >= 2 and B > 1)
+        smooth_path = (interpolation == "smooth")
+        if keyframing:
+            mid_az, mid_el, mid_dist = _sample_path(path, (B - 1) // 2, interp_motion, smooth_path)
+        elif kfs:
+            # a single keyframe is not a move -- treat it as the static pose
+            mid_az, mid_el, mid_dist = kfs[0][1], kfs[0][2], kfs[0][3]
         else:
             mid_az, mid_el, mid_dist = azimuth, elevation, distance
         C_tgt = _orbit_C_tgt(mid_az, mid_el, mid_dist, pivot)
@@ -610,20 +681,8 @@ class CrossViewWarp:
         pbar = ProgressBar(B) if ProgressBar is not None else None
         warp_frames = []
         for i in range(B):
-            if use_c_path:
-                t = i / (B - 1)
-                fr_az = _interp_abc_angle(A_azimuth, B_azimuth, C_azimuth, t, smooth_abc)
-                fr_el = _interp_abc(A_elevation, B_elevation, C_elevation, t, smooth_abc)
-                fr_dist = _interp_abc(A_distance, B_distance, C_distance, t, smooth_abc)
-                C_tgt_i = _orbit_C_tgt(fr_az, fr_el, fr_dist, pivot)
-                if applied_droll != 0.0:
-                    C_tgt_i = C_tgt_i.copy()
-                    C_tgt_i[:3, :3] = _rodrigues(C_tgt_i[:3, 2], applied_droll) @ C_tgt_i[:3, :3]
-            elif keyframing:
-                t = i / (B - 1)
-                fr_az = _interp_angle(A_azimuth, B_azimuth, t, interp_motion)
-                fr_el = _interp_value(A_elevation, B_elevation, t, interp_motion)
-                fr_dist = _interp_value(A_distance, B_distance, t, interp_motion)
+            if keyframing:
+                fr_az, fr_el, fr_dist = _sample_path(path, i, interp_motion, smooth_path)
                 C_tgt_i = _orbit_C_tgt(fr_az, fr_el, fr_dist, pivot)
                 if applied_droll != 0.0:
                     C_tgt_i = C_tgt_i.copy()
