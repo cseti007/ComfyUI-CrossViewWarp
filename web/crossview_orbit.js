@@ -28,6 +28,10 @@ const C_GREEN = [80, 200, 120], C_YELLOW = [230, 200, 90], C_RED = [225, 95, 95]
 const SNAP_DEG = 5;
 const HANDLE_R = 14;
 const WIDGET_H = 304;
+// Frames added per newly placed keyframe. The widget cannot know the clip
+// length (only the node sees it at execution), so new keyframes are spaced a
+// second apart at 24fps and the frame numbers stay editable in the widget.
+const KF_FRAME_STEP = 24;
 
 function inEllipse(az, el, [A, Eup, Edn]) {
   const an = az / A;
@@ -42,12 +46,6 @@ function zoneColor(az, el) {
 function d2r(x) { return (x * Math.PI) / 180; }
 function r2d(x) { return (x * 180) / Math.PI; }
 
-// Shortest-path (wrap-aware) linear interpolation between two angles in degrees.
-function lerpAngle(a, b, t) {
-  let diff = ((b - a + 540) % 360) - 180;
-  return a + diff * t;
-}
-
 // Distance ratio -> canvas radius multiplier. Piecewise so dist=1.0 lands on
 // the shell: dist<=1 spreads 0.45..1.0 (inside = closer), dist>1 spreads
 // 1.0..1.5 so the marker keeps moving all the way up to dist=3.0 (the old
@@ -58,22 +56,65 @@ function distScale(dist) {
   return 1.0 + 0.25 * (d - 1.0);
 }
 
-// Quadratic Bezier through 3 scalar values; pc = 2*b - 0.5*(a+c) makes the
-// curve pass through b at t=0.5 (otherwise b would be just the off-curve
-// control point).
-function bezier(a, b, c, t) {
-  const pc = 2 * b - 0.5 * (a + c);
-  const mt = 1 - t;
-  return mt * mt * a + 2 * mt * t * pc + t * t * c;
+// --- keyframe path math ------------------------------------------------------
+// Deliberate 1:1 mirror of _wrap_deg / _unwrap_seq / _catmull / _seg_value in
+// crossview_warp_node.py: the arc drawn here must be the path the node renders.
+
+function wrapDeg(a) { return (((a + 180) % 360) + 360) % 360 - 180; }
+
+// Unwrap a sequence of angles so each step takes the short way round; this is
+// what keeps a move across the +-180 seam continuous (170 -> -170 becomes
+// 170 -> 190) instead of sweeping the long way through 0.
+function unwrapSeq(degs) {
+  const out = [Number(degs[0])];
+  for (let i = 1; i < degs.length; i++) {
+    out.push(out[i - 1] + wrapDeg(Number(degs[i]) - out[i - 1]));
+  }
+  return out;
 }
-// Bezier for azimuth angles: unwrap b and c relative to the running tangent
-// so the control-point math stays continuous across the +-180 seam, then wrap
-// the result back to (-180, 180].
-function bezierAngle(aDeg, bDeg, cDeg, t) {
-  const bUnwrap = aDeg + (((bDeg - aDeg + 540) % 360) - 180);
-  const cUnwrap = bUnwrap + (((cDeg - bUnwrap + 540) % 360) - 180);
-  const val = bezier(aDeg, bUnwrap, cUnwrap, t);
-  return ((val + 180) % 360 + 360) % 360 - 180;
+
+// Uniform Catmull-Rom segment: passes through p1 at u=0 and p2 at u=1. Used
+// instead of a Bezier because it interpolates its control points, so every
+// keyframe is hit exactly and it generalises to any number of them.
+function catmull(p0, p1, p2, p3, u) {
+  return 0.5 * ((2 * p1)
+    + (-p0 + p2) * u
+    + (2 * p0 - 5 * p1 + 4 * p2 - p3) * u * u
+    + (-p0 + 3 * p1 - 3 * p2 + p3) * u * u * u);
+}
+
+// Value between vals[seg] and vals[seg+1] at local u. Ends reflect their
+// neighbour so the curve keeps its tangent; with two points Catmull-Rom is
+// identical to the lerp, so the simple case is unaffected.
+function segValue(vals, seg, u, smooth) {
+  const p1 = vals[seg], p2 = vals[seg + 1];
+  if (!smooth || vals.length < 3) return p1 + (p2 - p1) * u;
+  const p0 = seg > 0 ? vals[seg - 1] : p1 + (p1 - p2);
+  const p3 = seg + 2 < vals.length ? vals[seg + 2] : p2 + (p2 - p1);
+  return catmull(p0, p1, p2, p3, u);
+}
+
+function round1(v) { return Math.round(Number(v) * 10) / 10; }
+function round2(v) { return Math.round(Number(v) * 100) / 100; }
+
+// Read the `keyframes` widget into an ordered list of {f, az, el, dist}.
+// Anything unparseable yields [] here rather than throwing: the widget is
+// user-editable text, and a half-typed edit must not break the whole canvas.
+// The node itself re-validates and reports a real error at execution time.
+function parseKfs(raw) {
+  if (typeof raw !== "string" || !raw.trim()) return [];
+  let data;
+  try { data = JSON.parse(raw); } catch (e) { return []; }
+  if (!Array.isArray(data)) return [];
+  const out = [];
+  for (const kf of data) {
+    if (!kf || typeof kf !== "object") continue;
+    const f = Number(kf.f), az = Number(kf.az), el = Number(kf.el), dist = Number(kf.dist);
+    if (![f, az, el, dist].every(Number.isFinite)) continue;
+    out.push({ f: Math.round(f), az, el, dist });
+  }
+  out.sort((a, b) => a.f - b.f);
+  return out;
 }
 
 // sphere point for (az, el); home (0,0) faces the viewer (-y toward screen)
@@ -167,6 +208,7 @@ function getW(node, name) {
 
 class OrbitEditor {
   constructor(node, canvas) {
+    const self = this;
     this.node = node;
     this.canvas = canvas;
     this.ctx = canvas.getContext("2d");
@@ -178,18 +220,19 @@ class OrbitEditor {
     this.cacheKey = "";
     this._renderKey = "";
 
-    // S+click keyframe state: kfA / kfB / kfC are {az, el, dist} or null.
-    // kf*Pos are canvas-space centres written by render() and read by
-    // onKeyframeClick / onWheel / drag hit detection.
-    this.kfA = null;
-    this.kfB = null;
-    this.kfC = null;
-    this.kfAPos = null;
-    this.kfBPos = null;
-    this.kfCPos = null;
-    // abc_smooth mirror of the Python widget: drives the A->B->C arc shape
-    // (false = piecewise linear, true = quadratic Bezier through B).
-    this.abcSmooth = false;
+    // S+click keyframe state. this.kfs is the single source of truth: an
+    // ordered list of {f, az, el, dist}, serialised verbatim into the
+    // `keyframes` widget. Keeping every keyframe in one list (rather than
+    // fixed A/B/C slots) is what makes deletion a plain splice and removes
+    // the need for any "was this one placed?" sentinel.
+    this.kfs = [];
+    // canvas-space marker centres, written by render() and read by the drag
+    // and wheel hit-tests so both target what is actually drawn.
+    this.kfPos = [];
+    this._lastKfRaw = undefined;   // last `keyframes` string we read or wrote
+    this._lastKfCount = 0;         // to detect crossing the "is there a move" line
+    // `interpolation` mirror: false = straight legs, true = Catmull-Rom.
+    this.smoothPath = false;
     // use_keyframes mirror: when OFF the markers are rendered at 20% alpha so
     // the user can see the keyframed move is disabled without losing the
     // placements they made.
@@ -211,8 +254,11 @@ class OrbitEditor {
     canvas.addEventListener("mouseenter", () => { this._mouseOver = true; });
     canvas.addEventListener("mouseleave", () => { this._mouseOver = false; this.sHeld = false; });
     this._onKeyDown = (e) => {
-      if (!this.canvas.isConnected) { document.removeEventListener("keydown", this._onKeyDown); return; }
       if (!this._mouseOver) return;
+      // Never swallow a modified chord: Ctrl+S is ComfyUI's Save Workflow, and
+      // latching sHeld on it would leave the next plain click placing a
+      // keyframe the user never asked for.
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
       if (e.target && (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA")) return;
       if (e.key === "s" || e.key === "S") {
         this.sHeld = true;
@@ -228,13 +274,22 @@ class OrbitEditor {
     this._onMove = (e) => this.onMove(e);
     this._onUp = () => this.onUp();
 
-    // _writeKfWidgets runs now so the C sentinel is in place on a fresh node
-    // before any prompt can be queued. _restoreKeyframes is deferred to the
-    // first render — ComfyUI runs onNodeCreated (this constructor) BEFORE
-    // configure() loads the saved widget values, so reading widgets here
-    // would see defaults and miss the saved markers. By render time (next
-    // animation frame) configure has run and the saved values are visible.
-    this._writeKfWidgets();
+    // Tear the document-level listeners down when the node goes away. Chained
+    // rather than assigned: ComfyUI installs its own onRemoved for DOM widgets,
+    // and overwriting it would leak the widget registration instead.
+    const prevRemoved = node.onRemoved;
+    node.onRemoved = function () {
+      document.removeEventListener("keydown", self._onKeyDown);
+      document.removeEventListener("keyup", self._onKeyUp);
+      document.removeEventListener("pointermove", self._onMove);
+      document.removeEventListener("pointerup", self._onUp);
+      return prevRemoved?.apply(this, arguments);
+    };
+
+    // Reading the widgets is deferred to the first render — ComfyUI runs
+    // onNodeCreated (this constructor) BEFORE configure() loads saved widget
+    // values, so reading here would see defaults and miss a saved path. By
+    // render time (next animation frame) configure has run.
     this._needsRestore = true;
 
     // repaint when the number widgets change externally (cheap change-detect)
@@ -246,77 +301,57 @@ class OrbitEditor {
     requestAnimationFrame(this._raf);
   }
   _restoreKeyframes() {
-    // Restoring A/B/C is independent of use_keyframes: the markers must
-    // come back after a tab-switch / page reload even when the toggle is
-    // OFF (they just render dimmed - see markerAlpha in render()).
-    const aAz = getW(this.node, "A_azimuth")?.value;
-    const aEl = getW(this.node, "A_elevation")?.value;
-    const aDist = getW(this.node, "A_distance")?.value;
-    const bAz = getW(this.node, "B_azimuth")?.value;
-    const bEl = getW(this.node, "B_elevation")?.value;
-    const bDist = getW(this.node, "B_distance")?.value;
-    if (aAz != null && aEl != null && aDist != null) this.kfA = { az: aAz, el: aEl, dist: aDist };
-    if (bAz != null && bEl != null && bDist != null) this.kfB = { az: bAz, el: bEl, dist: bDist };
-    // C exists iff C_azimuth holds a real angle (the sentinel 999.0 means
-    // "never placed"; Python uses the same check on its side).
-    const cAz = getW(this.node, "C_azimuth")?.value;
-    if (typeof cAz === "number" && Math.abs(cAz) <= 180) {
-      const cEl = getW(this.node, "C_elevation")?.value;
-      const cDist = getW(this.node, "C_distance")?.value;
-      if (cEl != null && cDist != null) this.kfC = { az: cAz, el: cEl, dist: cDist };
-    }
+    // Restoring is independent of use_keyframes: the markers must come back
+    // after a tab-switch / page reload even when the toggle is OFF (they just
+    // render dimmed - see markerAlpha in render()). An unreadable string is
+    // left alone rather than overwritten, so a hand-edit typo is not silently
+    // destroyed by the widget being repainted.
+    this._lastKfRaw = getW(this.node, "keyframes")?.value;
+    this.kfs = parseKfs(this._lastKfRaw);
+    this._lastKfCount = this.kfs.length;
   }
-  // Pull A/B/C widget values back into the in-memory keyframe objects every
-  // frame so the user editing A_distance / B_distance / C_distance (or the
-  // az/el widgets after un-hiding them) moves the markers on the sphere.
+  // Re-read the widgets every frame so hand-edits to the `keyframes` string and
+  // the interpolation / use_keyframes toggles show up on the sphere.
   _syncFromWidgets() {
-    const pull = (kf, names) => {
-      if (!kf) return;
-      const az = getW(this.node, names.az)?.value;
-      const el = getW(this.node, names.el)?.value;
-      const dist = getW(this.node, names.dist)?.value;
-      if (az != null) kf.az = az;
-      if (el != null) kf.el = el;
-      if (dist != null) kf.dist = dist;
-    };
-    pull(this.kfA, { az: "A_azimuth", el: "A_elevation", dist: "A_distance" });
-    pull(this.kfB, { az: "B_azimuth", el: "B_elevation", dist: "B_distance" });
-    pull(this.kfC, { az: "C_azimuth", el: "C_elevation", dist: "C_distance" });
-    const sm = getW(this.node, "abc_smooth")?.value;
-    if (typeof sm === "boolean") this.abcSmooth = sm;
+    const raw = getW(this.node, "keyframes")?.value;
+    if (raw !== this._lastKfRaw) {
+      this._lastKfRaw = raw;
+      this.kfs = parseKfs(raw);
+      // a hand-edit is as authoritative as a click, so the threshold tracker
+      // must follow it too
+      this._lastKfCount = this.kfs.length;
+    }
+    const sm = getW(this.node, "interpolation")?.value;
+    if (typeof sm === "string") this.smoothPath = sm === "smooth";
     const uk = getW(this.node, "use_keyframes")?.value;
-    if (typeof uk === "boolean") this.useKeyframes = uk;
+    if (typeof uk === "boolean" && uk !== this.useKeyframes) {
+      this.useKeyframes = uk;
+      // the user can flip the toggle directly, not just via _writeKfWidgets
+      this.node._crossviewSyncHidden?.();
+    }
   }
   _writeKfWidgets() {
-    const setW = (name, v) => {
-      const w = getW(this.node, name);
-      if (w) w.value = v;
-    };
-    if (this.kfA) {
-      setW("A_azimuth", this.kfA.az);
-      setW("A_elevation", this.kfA.el);
-      setW("A_distance", this.kfA.dist);
+    const w = getW(this.node, "keyframes");
+    if (w) {
+      w.value = this.kfs.length
+        ? JSON.stringify(this.kfs.map((k) => ({
+            f: k.f, az: round1(k.az), el: round1(k.el), dist: round2(k.dist),
+          })))
+        : "";
+      this._lastKfRaw = w.value;   // our own write must not look like a hand-edit
     }
-    if (this.kfB) {
-      setW("B_azimuth", this.kfB.az);
-      setW("B_elevation", this.kfB.el);
-      setW("B_distance", this.kfB.dist);
+    // Follow the path only when it CROSSES the "is there a move at all"
+    // threshold: gaining a second keyframe turns the move on, dropping below
+    // two turns it off. Deliberately not set on every write — otherwise
+    // nudging a marker would override a user who had just switched the move
+    // off to compare against the static pose.
+    const usable = this.kfs.length >= 2;
+    if (usable !== (this._lastKfCount >= 2)) {
+      const wu = getW(this.node, "use_keyframes");
+      if (wu) wu.value = usable;
     }
-    if (this.kfC) {
-      setW("C_azimuth", this.kfC.az);
-      setW("C_elevation", this.kfC.el);
-      setW("C_distance", this.kfC.dist);
-    } else {
-      // kfC is null -> write the sentinel so Python's `abs(C_azimuth) <= 180`
-      // check evaluates False and the node falls back to 2-point interp.
-      setW("C_azimuth", 999.0);
-    }
-    // auto-flip use_keyframes ON once both A and B exist, so the user does
-    // not have to hunt for the toggle after placing the markers
-    if (this.kfA && this.kfB) {
-      const w = getW(this.node, "use_keyframes");
-      if (w && w.value === false) w.value = true;
-    }
+    this._lastKfCount = this.kfs.length;
+    this.node._crossviewSyncHidden?.();
     this.node.setDirtyCanvas(true, true);
   }
   onKeyframeClick(x, y) {
@@ -327,35 +362,41 @@ class OrbitEditor {
     const el = Math.round(ae[1] / SNAP_DEG) * SNAP_DEG;
     const dist = getW(this.node, "distance")?.value ?? 1;
 
+    // S+click on an existing marker deletes just that one; the rest keep their
+    // frame numbers, so removing a middle keyframe does not re-time the move.
     const HIT = 16;
-    const onA = this.kfAPos && Math.hypot(x - this.kfAPos[0], y - this.kfAPos[1]) <= HIT;
-    const onB = this.kfBPos && Math.hypot(x - this.kfBPos[0], y - this.kfBPos[1]) <= HIT;
-    const onC = this.kfCPos && Math.hypot(x - this.kfCPos[0], y - this.kfCPos[1]) <= HIT;
-
-    // Placement order is A -> B -> C. Clicking on an existing marker deletes
-    // it and shifts everyone behind it up one slot (B->A, C->B) so the chain
-    // stays contiguous with no gaps. When all three are placed, an S+click
-    // on empty space repositions C.
-    if (onA) {
-      this.kfA = this.kfB;
-      this.kfB = this.kfC;
-      this.kfC = null;
-    } else if (onB) {
-      this.kfB = this.kfC;
-      this.kfC = null;
-    } else if (onC) {
-      this.kfC = null;
-    } else if (!this.kfA) {
-      this.kfA = { az, el, dist };
-    } else if (!this.kfB) {
-      this.kfB = { az, el, dist };
-    } else if (!this.kfC) {
-      this.kfC = { az, el, dist };
+    const hit = this.kfs.findIndex((_, i) => this.kfPos[i] &&
+      Math.hypot(x - this.kfPos[i][0], y - this.kfPos[i][1]) <= HIT);
+    if (hit >= 0) {
+      this.kfs.splice(hit, 1);
     } else {
-      this.kfC = { az, el, dist };
+      if (!this.kfs.length) {
+        // Seed the path with the pose the user already dialled in, so the move
+        // starts where the camera currently is instead of discarding that work.
+        const v = this.vals();
+        this.kfs.push({ f: 0, az: v.az, el: v.el, dist: v.dist });
+      }
+      const lastF = this.kfs[this.kfs.length - 1].f;
+      this.kfs.push({ f: lastF + KF_FRAME_STEP, az, el, dist });
     }
     this._writeKfWidgets();
     this.render(true);
+  }
+  // Index of the keyframe marker nearest to (x, y) within `hit` px, or -1.
+  // Uses kfPos — where the marker is actually DRAWN — so drag, delete and the
+  // dolly wheel all target the thing under the cursor. (The wheel previously
+  // tested against the on-shell position, which for dist=0.2 is ~38px away
+  // from the visible marker: you could not scroll the marker you were pointing
+  // at.)
+  pickKf(x, y, hit) {
+    let best = hit, idx = -1;
+    for (let i = 0; i < this.kfs.length; i++) {
+      const p = this.kfPos[i];
+      if (!p) continue;
+      const d = Math.hypot(x - p[0], y - p[1]);
+      if (d < best) { best = d; idx = i; }
+    }
+    return idx;
   }
   vals() {
     return {
@@ -397,26 +438,12 @@ class OrbitEditor {
     if (this.handle && Math.hypot(x - this.handle[0], y - this.handle[1]) <= HANDLE_R + 10) {
       this.drag = "cam";
     } else {
-      // grab a keyframe marker (A/B/C) to drag it — reuses the closest-match
-      // pattern from onWheel so targeting feels consistent. Plain click only;
-      // S+click still routes through onKeyframeClick (place/delete).
-      const HIT = 20;
-      let kfDrag = null;
-      let best = HIT;
-      if (this.kfA && this.kfAPos) {
-        const d = Math.hypot(x - this.kfAPos[0], y - this.kfAPos[1]);
-        if (d < best) { best = d; kfDrag = "kfA"; }
-      }
-      if (this.kfB && this.kfBPos) {
-        const d = Math.hypot(x - this.kfBPos[0], y - this.kfBPos[1]);
-        if (d < best) { best = d; kfDrag = "kfB"; }
-      }
-      if (this.kfC && this.kfCPos) {
-        const d = Math.hypot(x - this.kfCPos[0], y - this.kfCPos[1]);
-        if (d < best) { best = d; kfDrag = "kfC"; }
-      }
-      if (kfDrag) {
-        this.drag = kfDrag;
+      // grab the nearest keyframe marker to drag it. Plain click only; S+click
+      // still routes through onKeyframeClick (place/delete).
+      const kfIdx = this.pickKf(x, y, 20);
+      if (kfIdx >= 0) {
+        this.drag = "kf";
+        this.dragKf = kfIdx;
       } else if (this.snapPts && this.snapPts.some(([sxp, syp]) => Math.hypot(x - sxp, y - syp) < 12)) {
         const [sxp, syp, a, e] = this.snapPts.find(([sxp2, syp2]) => Math.hypot(x - sxp2, y - syp2) < 12);
         const wA = getW(this.node, "azimuth"), wE = getW(this.node, "elevation");
@@ -442,18 +469,16 @@ class OrbitEditor {
       this.view.viewTilt += (y - this.lastPos[1]) * 0.01;
       this.view.viewTilt = Math.max(-1.4, Math.min(1.4, this.view.viewTilt));
       this.lastPos = [x, y];
-    } else if (this.drag === "kfA" || this.drag === "kfB" || this.drag === "kfC") {
+    } else if (this.drag === "kf") {
       // drag the picked keyframe on the sphere — same unproject+snap math as
-      // the camera handle, but writes az/el into the kf and its widgets.
-      // dist is left alone (the wheel owns that axis).
+      // the camera handle, but writes az/el into the keyframe. dist is left
+      // alone (the wheel owns that axis) and so is f (the timing).
       const ae = this.view.unproject(x - g.cx, y - g.cy, g.R);
-      if (ae) {
-        const kf = this[this.drag];
-        if (kf) {
-          kf.az = Math.round(ae[0] / SNAP_DEG) * SNAP_DEG;
-          kf.el = Math.round(ae[1] / SNAP_DEG) * SNAP_DEG;
-          this._writeKfWidgets();
-        }
+      const kf = this.kfs[this.dragKf];
+      if (ae && kf) {
+        kf.az = Math.round(ae[0] / SNAP_DEG) * SNAP_DEG;
+        kf.el = Math.round(ae[1] / SNAP_DEG) * SNAP_DEG;
+        this._writeKfWidgets();
       }
     } else {
       const ae = this.view.unproject(x - g.cx, y - g.cy, g.R);
@@ -474,36 +499,22 @@ class OrbitEditor {
   onWheel(e) {
     e.preventDefault(); e.stopPropagation();
     const [mx, my] = this.canvasPos(e);
-    const g = this.geom();
-    // On-shell projection of a keyframe: depends only on (az, el), NOT on
-    // dist -> stable while the dolly wheel actually moves the marker along
-    // its ray, so the targeted keyframe can't flip mid-scroll.
-    const shellPos = (kf) => {
-      const [xr, , zv] = this.view.rot(spherePt(kf.az, kf.el));
-      return [g.cx + g.R * xr, g.cy - g.R * zv];
-    };
-    const HIT = 22;
-    let target = "distance";
-    let best = HIT;
-    if (this.kfA) {
-      const [ax, ay] = shellPos(this.kfA);
-      const d = Math.hypot(mx - ax, my - ay);
-      if (d < best) { best = d; target = "A_distance"; }
+    const step = -Math.sign(e.deltaY) * 0.05;
+    const clampDist = (v) => Math.max(0.2, Math.min(3.0, Math.round(v * 100) / 100));
+
+    // Hovering a keyframe dollies THAT keyframe; anywhere else dollies the
+    // static camera. Both use the drawn marker position (see pickKf).
+    const idx = this.pickKf(mx, my, 22);
+    if (idx >= 0) {
+      const kf = this.kfs[idx];
+      kf.dist = clampDist(kf.dist + step);
+      this._writeKfWidgets();
+      this.render(true);
+      return;
     }
-    if (this.kfB) {
-      const [bx, by] = shellPos(this.kfB);
-      const d = Math.hypot(mx - bx, my - by);
-      if (d < best) { best = d; target = "B_distance"; }
-    }
-    if (this.kfC) {
-      const [cx, cy] = shellPos(this.kfC);
-      const d = Math.hypot(mx - cx, my - cy);
-      if (d < best) { best = d; target = "C_distance"; }
-    }
-    const wD = getW(this.node, target);
+    const wD = getW(this.node, "distance");
     if (wD) {
-      wD.value = Math.max(0.2, Math.min(3.0,
-        Math.round((wD.value - Math.sign(e.deltaY) * 0.05) * 100) / 100));
+      wD.value = clampDist(wD.value + step);
       this.node.setDirtyCanvas(true, true);
       this.render(true);
     }
@@ -526,12 +537,12 @@ class OrbitEditor {
       this.canvas.height = chh;
       this.cacheKey = "";   // sphere cache is size-dependent -> rebuild
     }
-    // pick up A/B widget edits (e.g. user dragging the A_distance slider)
-    // before computing the render cache key, so changing them forces a redraw
+    // pick up widget edits (e.g. a hand-edited keyframes string) before
+    // computing the render cache key, so changing them forces a redraw
     this._syncFromWidgets();
     const { az, el, dist } = this.vals();
     const g = this.geom();
-    const kfKey = `${this.kfA ? `${this.kfA.az.toFixed(1)},${this.kfA.el.toFixed(1)},${this.kfA.dist.toFixed(2)}` : "x"}|${this.kfB ? `${this.kfB.az.toFixed(1)},${this.kfB.el.toFixed(1)},${this.kfB.dist.toFixed(2)}` : "x"}|${this.kfC ? `${this.kfC.az.toFixed(1)},${this.kfC.el.toFixed(1)},${this.kfC.dist.toFixed(2)}` : "x"}|${this.abcSmooth ? 1 : 0}|${this.useKeyframes ? 1 : 0}`;
+    const kfKey = `${this.kfs.map((k) => `${k.f},${k.az.toFixed(1)},${k.el.toFixed(1)},${k.dist.toFixed(2)}`).join(";")}|${this.smoothPath ? 1 : 0}|${this.useKeyframes ? 1 : 0}`;
     const key = `${az}|${el}|${dist}|${this.view.viewYaw.toFixed(3)}|${this.view.viewTilt.toFixed(3)}|${kfKey}|${this.canvas.width}x${this.canvas.height}`;
     if (!force && key === this._renderKey) return;
     this._renderKey = key;
@@ -619,45 +630,31 @@ class OrbitEditor {
     ctx.beginPath(); ctx.arc(px + 5, py, 3.5, 0, Math.PI * 2); ctx.fill();
     ctx.globalAlpha = 1.0;
 
-    // --- keyframe markers (S+click): green dots A/B/C joined by a green arc
-    // mirroring the blue home->camera arc above. With only A+B the arc is a
-    // straight wrap-aware lerp. With A+B+C it follows `abc_smooth`: piecewise
-    // linear (corner at B) when OFF, or a quadratic Bezier whose control point
-    // is 2*B - 0.5*(A+C) so the curve still passes through B at t=0.5 when ON.
-    // markerAlpha dims the whole keyframe overlay to 20% when use_keyframes
-    // is OFF, so placements persist visually but read as disabled.
+    // --- keyframe markers (S+click): green dots joined by a green arc that
+    // mirrors the blue home->camera arc above. The arc is walked segment by
+    // segment with the same unwrap + Catmull-Rom math the node uses, so what
+    // is drawn here is the path that will actually be rendered. Segment
+    // spacing on screen shows shape only — the timing lives in each keyframe's
+    // frame number. markerAlpha dims the overlay to 20% when use_keyframes is
+    // OFF, so placements persist visually but read as disabled.
     const markerAlpha = this.useKeyframes ? 1.0 : 0.2;
-    this.kfAPos = null;
-    this.kfBPos = null;
-    this.kfCPos = null;
-    if (this.kfA && this.kfB) {
+    this.kfPos = [];
+    if (this.kfs.length >= 2) {
+      const azU = unwrapSeq(this.kfs.map((k) => k.az));
+      const els = this.kfs.map((k) => k.el);
       ctx.globalAlpha = markerAlpha;
       ctx.strokeStyle = "#5fce80"; ctx.lineWidth = 2.5;
       ctx.beginPath();
-      const STEPS = this.kfC ? 42 : 28;
-      for (let i = 0; i <= STEPS; i++) {
-        const t = i / STEPS;
-        let a, e;
-        if (this.kfC && this.abcSmooth) {
-          a = bezierAngle(this.kfA.az, this.kfB.az, this.kfC.az, t);
-          e = bezier(this.kfA.el, this.kfB.el, this.kfC.el, t);
-        } else if (this.kfC) {
-          // piecewise linear: A->B->C with B exactly at t=0.5
-          if (t <= 0.5) {
-            const tt = t / 0.5;
-            a = lerpAngle(this.kfA.az, this.kfB.az, tt);
-            e = this.kfA.el + (this.kfB.el - this.kfA.el) * tt;
-          } else {
-            const tt = (t - 0.5) / 0.5;
-            a = lerpAngle(this.kfB.az, this.kfC.az, tt);
-            e = this.kfB.el + (this.kfC.el - this.kfB.el) * tt;
-          }
-        } else {
-          a = lerpAngle(this.kfA.az, this.kfB.az, t);
-          e = this.kfA.el + (this.kfB.el - this.kfA.el) * t;
+      const SUB = 24;
+      let started = false;
+      for (let seg = 0; seg < this.kfs.length - 1; seg++) {
+        for (let s = 0; s <= SUB; s++) {
+          const u = s / SUB;
+          const a = wrapDeg(segValue(azU, seg, u, this.smoothPath));
+          const e = segValue(els, seg, u, this.smoothPath);
+          const [ax, ay] = P(a, e);
+          if (started) ctx.lineTo(ax, ay); else { ctx.moveTo(ax, ay); started = true; }
         }
-        const [ax, ay] = P(a, e);
-        i ? ctx.lineTo(ax, ay) : ctx.moveTo(ax, ay);
       }
       ctx.stroke();
       ctx.globalAlpha = 1.0;
@@ -684,16 +681,16 @@ class OrbitEditor {
       ctx.fillStyle = "#5fce80";
       ctx.beginPath(); ctx.arc(kpx, kpy, 10, 0, Math.PI * 2); ctx.fill();
       ctx.fillStyle = "#0e1410";
-      ctx.font = "bold 12px monospace";
+      ctx.font = "bold 11px monospace";
       const lw = ctx.measureText(label).width;
       ctx.fillText(label, kpx - lw / 2, kpy + 4);
       ctx.globalAlpha = 1.0;
       return [kpx, kpy];
     };
-    if (this.kfA) this.kfAPos = drawKf(this.kfA, "A");
-    if (this.kfB) this.kfBPos = drawKf(this.kfB, "B");
-    if (this.kfC) this.kfCPos = drawKf(this.kfC, "C");
-
+    // Label each marker with its FRAME number, not a letter: the timing is the
+    // one thing the sphere cannot show geometrically, and it is what the user
+    // edits in the keyframes widget.
+    this.kfPos = this.kfs.map((kf) => drawKf(kf, String(kf.f)));
   }
 }
 
@@ -727,13 +724,31 @@ app.registerExtension({
           getHeight: () => WIDGET_H,
         });
         node._crossviewOrbit = new OrbitEditor(node, canvas);
-        // hide the A/B/C az/el widgets: their values are driven by S+click on
-        // the sphere, so showing six extra number fields would be noise.
-        // User can re-enable via right-click -> show hidden widget if needed.
-        for (const name of ["A_azimuth", "A_elevation", "B_azimuth", "B_elevation", "C_azimuth", "C_elevation"]) {
-          const w = node.widgets?.find((w) => w.name === name);
-          if (w) w.hidden = true;
-        }
+
+        // While a keyframed move is active the static azimuth/elevation/distance
+        // do nothing, so hide them rather than leave three dead controls that
+        // still draw a camera handle. Their values are kept (the first keyframe
+        // is seeded from them) and they come back when the path is cleared.
+        //
+        // Both flags are set on purpose: the canvas renderer reads widget.hidden,
+        // the Vue node renderer reads widget.options.hidden and does NOT fall
+        // back to the former. Setting only one leaves them visible in one of the
+        // two frontends.
+        node._crossviewSyncHidden = () => {
+          const active = node.widgets?.find((w) => w.name === "use_keyframes")?.value === true;
+          let changed = false;
+          for (const name of ["azimuth", "elevation", "distance"]) {
+            const w = node.widgets?.find((x) => x.name === name);
+            if (!w || w.hidden === active) continue;
+            w.hidden = active;
+            if (w.options) w.options.hidden = active;
+            changed = true;
+          }
+          // Only resize when something actually changed — computeSize() on every
+          // frame would fight the user resizing the node by hand.
+          if (changed) node.setSize(node.computeSize());
+        };
+        node._crossviewSyncHidden();
         node.setSize(node.computeSize());
         console.log("[CrossView Orbit] DOM widget attached to node", node.id);
       } catch (e) {
