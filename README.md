@@ -20,13 +20,13 @@ https://huggingface.co/Cseti/LTX2.3-22B_IC-LoRA-CrossView-Warp
 
 ## Demo
 
-Dragging the camera handle: the warp follows the pose, magenta marking what the
+Dragging the camera handle: the warp follows the angle, magenta fills what the
 source camera never saw.
 
 ![Static camera pose](assets/orbit-default.gif)
 
-With `use_keyframes` on, right-clicking the sphere drops keyframes — each
-labelled with its frame number — and the node interpolates a pose per frame.
+With `use_keyframes` on, right-clicking the sphere drops keyframes - each
+labelled with its frame number - and the node interpolates a angle per frame.
 
 ![Keyframed camera move](assets/orbit-keyframes.gif)
 
