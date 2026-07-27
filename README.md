@@ -11,6 +11,9 @@ The node has a built-in 3D orbit picker widget — a sphere around the subject
 where you drag the camera marker instead of typing angles. The green/yellow
 shading on it shows the ranges the LoRA was trained for.
 
+It also does camera *moves*: right-click the sphere to drop keyframes, and the
+node interpolates a pose per frame instead of holding one for the whole clip.
+
 This whole thing is a proof of concept. The LoRA card lists what works and
 what doesn't — read it before expecting magic:
 https://huggingface.co/Cseti/LTX2.3-22B_IC-LoRA-CrossView-Warp
@@ -62,7 +65,7 @@ pip install numba
 | Output | What it is |
 |---|---|
 | `warp` | the warp control video — wire to an IC-LoRA reference guide (`latent_downscale_factor = 1`) |
-| `orbit_view` | a rendered image of the orbit sphere with your camera setup — wire to a PreviewImage/SaveImage to document what you asked for |
+| `orbit_view` | a rendered image of the orbit sphere with your camera setup — the single pose, or the whole keyframed path with its frame-numbered markers — wire to a PreviewImage/SaveImage to document what you asked for |
 
 Key inputs (all have tooltips in the UI):
 
@@ -79,6 +82,87 @@ Key inputs (all have tooltips in the UI):
 - `roll_lock` (default on) — keeps the subject's in-image lean the same as the
   source, so a tilted source shot doesn't tip the character over at large
   angles
+- `use_keyframes` / `keyframes` / `frame_count` / `interp_motion` /
+  `interpolation` — a camera move instead of a single pose. See
+  [Keyframed camera move](#keyframed-camera-move-right-click) below.
+
+### Keyframed camera move (right-click)
+
+**Right-click** the orbit sphere to place a camera keyframe. The first one also
+captures your current azimuth/elevation/distance as the starting keyframe, so a
+single right-click gives you a complete move. Left-drag a marker to move it,
+hover it and scroll the wheel to dolly it, right-click it again to delete it.
+Each marker is labelled with its **frame number**.
+
+The gesture is deliberately mouse-only. A modifier key can be claimed by any
+other node pack through ComfyUI's keybinding system — KJNodes, for one, binds S
+to a node-swap gesture that disconnects and repositions whatever node is under
+the cursor — so the sphere uses a plain mouse button that nothing else can
+intercept. Note that right-clicking inside the sphere therefore does not open the
+node's context menu; right-click the node's title or body for that.
+
+Placing a second keyframe enables `use_keyframes` and hides the static
+azimuth/elevation/distance (they do nothing while a move is running, and come
+back when you clear the path). Toggling `use_keyframes` off leaves the markers
+visible but dimmed, so you can compare against the static pose without losing
+the setup.
+
+The path itself lives in the `keyframes` widget as JSON, and you can edit it by
+hand — which is currently the way to fine-tune the timing:
+
+```json
+[{"f":1,"az":-30,"el":20,"dist":1.0},{"f":49,"az":45,"el":10,"dist":1.2}]
+```
+
+`f` is an absolute frame number, counted from 1. Before the first and after the
+last keyframe the camera **holds**, so a path may cover only part of the clip —
+"swing for the first two seconds, then sit still" is just a path that ends early.
+A keyframe past the end of the clip is an error rather than a silently truncated
+move, so a path authored for a longer clip tells you instead of quietly doing the
+wrong thing.
+
+`dist` carries the same caveat as the static `distance` above: the current LoRA
+does not follow it reliably, so keyframing a dolly move will disappoint until the
+next release. Angles are what this is good at.
+
+Set `frame_count` to your clip's length and the sphere will spread keyframes
+evenly across it — the last one always lands on the final frame, and adding or
+deleting a keyframe re-spreads the rest:
+
+```
+frame_count = 97,  2 keyframes -> f = 1, 97
+                   3 keyframes -> f = 1, 49, 97
+                   5 keyframes -> f = 1, 25, 49, 73, 97
+```
+
+Hand-edit any frame number in the widget and the even spread stops being
+re-applied, so your timing survives further edits on the sphere. Leave
+`frame_count` at 0 and new keyframes are simply placed 24 frames apart, as the
+widget has no way of knowing the clip length on its own.
+
+Changing `frame_count` refits the existing path onto the new length: the first
+keyframe moves to 1, the last to the new final frame, and the ones between keep
+their relative spacing. So it also works the other way round — place keyframes
+first, then type the clip length, and they stretch to fit.
+
+### Feeding `keyframes` from another node
+
+Convert `keyframes` to an input and the sphere becomes read-only: the node will
+render whatever the upstream sends, so letting you edit markers here would show a
+path that is not the one produced. If the upstream is a literal (a primitive or
+string-constant node) the sphere previews its path; if the string is computed at
+execution time there is nothing to preview, and the sphere says so rather than
+leaving a stale local path on screen.
+
+Two options shape the result:
+
+- `interpolation` — `linear` gives straight legs with a corner at each keyframe;
+  `smooth` runs a Catmull-Rom spline through them (still passing exactly through
+  every keyframe). With only two keyframes the two are identical.
+- `interp_motion` — timing between consecutive keyframes. Applied per segment,
+  so `ease_in_out` settles the camera into every keyframe. Pair easing with
+  `linear`; combining it with `smooth` cancels the very continuity the spline
+  is there to provide.
 
 ## Generation settings that worked for me
 

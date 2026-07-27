@@ -12,6 +12,9 @@ it was trained on. Depth is normalised globally across the clip for temporal
 consistency and re-centred so an off-centre subject stays framed.
 """
 
+import json
+import logging
+
 import numpy as np
 import torch
 
@@ -21,6 +24,19 @@ except Exception:  # allow standalone import (tests / non-ComfyUI use)
     ProgressBar = None
 
 MAGENTA = np.array([255, 0, 255], dtype=np.uint8)
+
+
+def _dist_scale(d):
+    """Map source-distance ratio (0.2..3.0) to a canvas radius multiplier.
+
+    Piecewise so dist=1.0 lands exactly on the shell (multiplier 1.0):
+    dist<=1 spreads 0.45..1.0 (inside the shell = closer), dist>1 spreads
+    1.0..1.5 so the marker keeps moving visibly all the way up to 3.0
+    (the previous clamp at 1.3 froze it past dist~=1.55)."""
+    d = float(d)
+    if d <= 1.0:
+        return 0.45 + 0.55 * d
+    return 1.0 + 0.25 * (d - 1.0)
 
 try:
     from numba import njit
@@ -46,16 +62,22 @@ except Exception:
     _HAVE_NUMBA = False
 
 
-def _orbit_view_image(azimuth, elevation, distance, size=512):
+def _orbit_view_image(azimuth, elevation, distance, size=512, kfs=None, smooth=False):
     """1:1 port of the crossview_orbit.js widget's default view (gizmo style):
     coverage zone hint, equator/meridian rings, snap dots (F/L/R/+-90/H/Lo),
-    dolly ray + 1.0x tick, camera handle with viewfinder lines."""
+    dolly ray + 1.0x tick, camera handle with viewfinder lines.
+
+    Pass `kfs` (the parsed keyframe list) to draw the camera PATH instead of the
+    single pose -- green arc plus frame-numbered markers, matching the widget."""
     from PIL import Image, ImageDraw, ImageFont
     W = H = size
     k = size / 300.0                     # widget geometry is authored at ~300px height
     S = min(W - 16 * k, H - 12 * k)
     cx, cy = W / 2.0, H / 2.0
-    R = (S / 2.0 - 4 * k) * 0.76
+    # 0.62 (not 0.76) so the camera handle still fits when _dist_scale reaches
+    # 1.5R at dist=3.0 -- must stay in step with geom() in web/crossview_orbit.js,
+    # which this function is a 1:1 port of.
+    R = (S / 2.0 - 4 * k) * 0.62
     yaw, tilt = 0.24, 0.20               # widget default view
 
     ZONE_GREEN, ZONE_YELLOW = (45, 30, 15), (65, 40, 25)
@@ -152,40 +174,103 @@ def _orbit_view_image(azimuth, elevation, distance, size=512):
             bb = d.textbbox((0, 0), lab, font=f_dot)
             d.text((sxp - (bb[2] - bb[0]) / 2, syp - (bb[3] - bb[1]) / 2 - bb[1]), lab, fill=tcol, font=f_dot)
 
-    # arc home -> camera (width 2.5 @300px)
-    for i in range(14):
-        x1, y1, _ = pt(azimuth * i / 14.0, elevation * i / 14.0)
-        x2, y2, _ = pt(azimuth * (i + 1) / 14.0, elevation * (i + 1) / 14.0)
-        d.line([x1, y1, x2, y2], fill=(120, 190, 255, 255), width=max(2, round(2.5 * k)))
+    def dashed(x1, y1, x2, y2, col, w):
+        seg = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5 + 1e-9
+        dash, gap = 4 * k, 4 * k
+        t = 0.0
+        while t < seg:
+            t2 = min(t + dash, seg)
+            d.line([x1 + (x2 - x1) * t / seg, y1 + (y2 - y1) * t / seg,
+                    x1 + (x2 - x1) * t2 / seg, y1 + (y2 - y1) * t2 / seg], fill=col, width=w)
+            t = t2 + gap
 
-    # dolly ray (dashed, subject -> 1.32x) + 1.0x tick
-    sx, sy, front = pt(azimuth, elevation)
-    vx, vy = sx - cx, sy - cy
-    L = (vx * vx + vy * vy) ** 0.5 + 1e-9
-    dash, gap = 4 * k, 4 * k
-    t = 0.0
-    while t < 1.32 * L:
-        t2 = min(t + dash, 1.32 * L)
-        d.line([cx + vx / L * t, cy + vy / L * t, cx + vx / L * t2, cy + vy / L * t2],
-               fill=(120, 190, 255, 90), width=max(1, round(k)))
-        t = t2 + gap
-    r3 = 3 * k
-    d.ellipse([sx - r3, sy - r3, sx + r3, sy + r3], outline=(255, 255, 255, 153), width=max(1, round(k)))
+    def dim(col, front):
+        """Fade a colour toward the background for markers on the far side.
 
-    # camera handle at distance-scaled radius, with viewfinder lines
-    distF = float(np.clip(0.45 + 0.55 * distance, 0.45, 1.3))
-    px = cx + vx * distF
-    py = cy + vy * distF
-    al = 255 if front < 0 else 115
-    for dx, dy in ((-8, -6), (8, -6), (-8, 6), (8, 6)):
-        d.line([px, py, cx + dx * k, cy + (dy - 6) * k], fill=(120, 190, 255, al), width=max(1, round(k)))
-    d.rounded_rectangle([px - 13 * k, py - 9 * k, px + 13 * k, py + 9 * k], radius=4 * k,
-                        fill=(120, 190, 255, al), outline=(255, 255, 255, al), width=max(2, round(2 * k)))
-    r35 = 3.5 * k
-    d.ellipse([px + 5 * k - r35, py - r35, px + 5 * k + r35, py + r35], fill=(32, 36, 44, al))
+        Done by mixing rather than by an alpha value: this ImageDraw writes
+        straight onto an opaque image, so an alpha in the fill would be dropped
+        by the final convert("RGB") and the marker would come out full strength."""
+        if front < 0:
+            return col + (255,)
+        return tuple(round(c + (b - c) * 0.55) for c, b in zip(col, (27, 27, 31))) + (255,)
 
-    d.text((8 * k, 6 * k), f"az {azimuth:+.0f}  el {elevation:+.0f}  dist {distance:.2f}x",
-           fill=(255, 255, 100, 255), font=f_txt)
+    if not kfs:
+        # Static pose: the blue camera overlay. Skipped entirely during a
+        # keyframed move (as the widget does), since azimuth/elevation/distance
+        # do not drive the render then and drawing both would show two cameras.
+
+        # arc home -> camera (width 2.5 @300px)
+        for i in range(14):
+            x1, y1, _ = pt(azimuth * i / 14.0, elevation * i / 14.0)
+            x2, y2, _ = pt(azimuth * (i + 1) / 14.0, elevation * (i + 1) / 14.0)
+            d.line([x1, y1, x2, y2], fill=(120, 190, 255, 255), width=max(2, round(2.5 * k)))
+
+        # dolly ray (dashed, subject -> 1.32x) + 1.0x tick
+        sx, sy, front = pt(azimuth, elevation)
+        vx, vy = sx - cx, sy - cy
+        L = (vx * vx + vy * vy) ** 0.5 + 1e-9
+        dashed(cx, cy, cx + vx / L * 1.32 * L, cy + vy / L * 1.32 * L,
+               (120, 190, 255, 90), max(1, round(k)))
+        r3 = 3 * k
+        d.ellipse([sx - r3, sy - r3, sx + r3, sy + r3], outline=(255, 255, 255, 153),
+                  width=max(1, round(k)))
+
+        # camera handle at distance-scaled radius, with viewfinder lines
+        distF = _dist_scale(distance)
+        px = cx + vx * distF
+        py = cy + vy * distF
+        al = 255 if front < 0 else 115
+        for dx, dy in ((-8, -6), (8, -6), (-8, 6), (8, 6)):
+            d.line([px, py, cx + dx * k, cy + (dy - 6) * k], fill=(120, 190, 255, al),
+                   width=max(1, round(k)))
+        d.rounded_rectangle([px - 13 * k, py - 9 * k, px + 13 * k, py + 9 * k], radius=4 * k,
+                            fill=(120, 190, 255, al), outline=(255, 255, 255, al),
+                            width=max(2, round(2 * k)))
+        r35 = 3.5 * k
+        d.ellipse([px + 5 * k - r35, py - r35, px + 5 * k + r35, py + r35], fill=(32, 36, 44, al))
+
+        label = f"az {azimuth:+.0f}  el {elevation:+.0f}  dist {distance:.2f}x"
+    else:
+        # Keyframed move: the same green path the orbit widget draws, so this
+        # output documents the actual camera move rather than one pose from it.
+        # Walked segment by segment with the shared unwrap + Catmull-Rom helpers,
+        # which is what keeps it identical to the widget and to the render.
+        if len(kfs) >= 2:
+            az_un = _unwrap_seq([kf[1] for kf in kfs])
+            els = [kf[2] for kf in kfs]
+            SUB = 24
+            prev = None
+            for seg in range(len(kfs) - 1):
+                for s in range(SUB + 1):
+                    u = s / SUB
+                    a = _wrap_deg(_seg_value(az_un, seg, u, smooth))
+                    e = _seg_value(els, seg, u, smooth)
+                    x1, y1, _ = pt(a, e)
+                    if prev is not None:
+                        d.line([prev[0], prev[1], x1, y1], fill=(95, 206, 128, 255),
+                               width=max(2, round(2.5 * k)))
+                    prev = (x1, y1)
+
+        for f_no, kaz, kel, kdist in kfs:
+            kx, ky, kfront = pt(kaz, kel)
+            distFk = _dist_scale(kdist)
+            kpx, kpy = cx + (kx - cx) * distFk, cy + (ky - cy) * distFk
+            dashed(kpx, kpy, kx, ky, dim((95, 206, 128), kfront), max(1, round(k)))
+            r3 = 3 * k
+            d.ellipse([kx - r3, ky - r3, kx + r3, ky + r3],
+                      outline=dim((190, 190, 200), kfront), width=max(1, round(k)))
+            rr = 10 * k
+            d.ellipse([kpx - rr, kpy - rr, kpx + rr, kpy + rr], fill=dim((95, 206, 128), kfront),
+                      outline=dim((255, 255, 255), kfront), width=max(2, round(2 * k)))
+            lab = str(f_no)
+            bb = d.textbbox((0, 0), lab, font=f_dot)
+            d.text((kpx - (bb[2] - bb[0]) / 2, kpy - (bb[3] - bb[1]) / 2 - bb[1]), lab,
+                   fill=(14, 20, 16, 255), font=f_dot)
+
+        label = (f"{len(kfs)} keyframes  f{kfs[0][0]}-{kfs[-1][0]}  "
+                 f"{'smooth' if smooth else 'linear'}")
+
+    d.text((8 * k, 6 * k), label, fill=(255, 255, 100, 255), font=f_txt)
     return np.asarray(img.convert("RGB"), dtype=np.uint8)
 
 
@@ -276,6 +361,172 @@ def _depth_to_z(depth_bhw, invert, ratio=4.0):
     return 1.0 / (1.0 / r + (1.0 - 1.0 / r) * dn)
 
 
+# --- keyframe interpolation --------------------------------------------------
+
+def _wrap_deg(a):
+    """Wrap degrees to (-180, 180]."""
+    return ((a + 180.0) % 360.0) - 180.0
+
+
+def _ease(t, mode):
+    """Map linear t in [0,1] to eased t in [0,1] per the chosen curve."""
+    if mode == "ease_in_out":
+        return 0.5 - 0.5 * np.cos(np.pi * t)
+    if mode == "ease_in":
+        return t * t
+    if mode == "ease_out":
+        return 1.0 - (1.0 - t) * (1.0 - t)
+    return t   # "linear" / unknown -> identity
+
+
+def _unwrap_seq(degs):
+    """Unwrap a sequence of angles so each step takes the short way round.
+
+    Interpolating in unwrapped space is what keeps a move across the +-180 seam
+    continuous (170 -> -170 becomes 170 -> 190); the result is wrapped back at
+    the end."""
+    out = [float(degs[0])]
+    for d in degs[1:]:
+        out.append(out[-1] + _wrap_deg(float(d) - out[-1]))
+    return out
+
+
+def _catmull(p0, p1, p2, p3, u):
+    """Uniform Catmull-Rom segment: passes through p1 at u=0 and p2 at u=1.
+
+    Chosen over a Bezier because it INTERPOLATES its control points -- every
+    keyframe is hit exactly -- and it generalises to any number of points,
+    unlike a quadratic Bezier which only lands on the middle point via a
+    hand-fitted control point."""
+    return 0.5 * ((2.0 * p1)
+                  + (-p0 + p2) * u
+                  + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * u * u
+                  + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * u * u * u)
+
+
+def _seg_value(vals, seg, u, smooth):
+    """Value between vals[seg] and vals[seg+1] at local position u in [0,1].
+
+    smooth=False is a straight lerp. smooth=True is Catmull-Rom, which needs the
+    two neighbouring points; at the ends they are reflected so the curve keeps
+    its tangent instead of flattening. With only two keyframes Catmull-Rom is
+    identical to the lerp, so the simple case is unaffected."""
+    p1, p2 = vals[seg], vals[seg + 1]
+    if not smooth or len(vals) < 3:
+        return p1 + (p2 - p1) * u
+    p0 = vals[seg - 1] if seg > 0 else p1 + (p1 - p2)
+    p3 = vals[seg + 2] if seg + 2 < len(vals) else p2 + (p2 - p1)
+    return _catmull(p0, p1, p2, p3, u)
+
+
+def _parse_keyframes(raw, frame_count):
+    """Parse the `keyframes` widget into a sorted [(frame, az, el, dist), ...].
+
+    Frame numbers are 1-based, matching how the clip reads to a user (frame 1 is
+    the first frame, frame `frame_count` the last); the loop in build() converts.
+
+    Empty input means "no camera move". Anything malformed raises ValueError with
+    a message written for the user: a silently truncated or misread camera move is
+    worse than a failed queue, and every bug class this format replaced was of the
+    silently-wrong kind."""
+    if raw is None:
+        return []
+    raw = str(raw).strip()
+    if not raw or raw in ("[]", "null"):
+        return []
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "CrossViewWarp: 'keyframes' is not valid JSON (%s). Expected something like "
+            '[{"f":1,"az":-30,"el":20,"dist":1.0},{"f":49,"az":45,"el":10,"dist":1.2}]' % exc
+        ) from None
+    if not isinstance(data, list):
+        raise ValueError("CrossViewWarp: 'keyframes' must be a JSON list of keyframe objects.")
+
+    out = []
+    for i, kf in enumerate(data):
+        if not isinstance(kf, dict):
+            raise ValueError("CrossViewWarp: keyframe #%d is not an object." % i)
+        try:
+            f = int(round(float(kf["f"])))
+            az, el, dist = float(kf["az"]), float(kf["el"]), float(kf["dist"])
+        except (KeyError, TypeError, ValueError):
+            raise ValueError(
+                "CrossViewWarp: keyframe #%d needs numeric 'f', 'az', 'el' and 'dist'." % i
+            ) from None
+        if f < 1:
+            raise ValueError(
+                "CrossViewWarp: keyframe #%d sits at frame %d - frame numbers start at 1 "
+                "(frame 1 is the first frame of the clip)." % (i, f))
+        if f > frame_count:
+            raise ValueError(
+                "CrossViewWarp: keyframe #%d sits at frame %d, but this clip only has %d frames. "
+                "The camera path was authored for a longer clip -- move that keyframe, or feed a "
+                "longer clip." % (i, f, frame_count))
+        out.append((f, az, el, dist))
+
+    out.sort(key=lambda k: k[0])
+    seen = [k[0] for k in out]
+    if len(set(seen)) != len(seen):
+        raise ValueError("CrossViewWarp: two keyframes share the same frame number.")
+    return out
+
+
+def _prepare_path(kfs):
+    """Pre-split the keyframe list into the arrays the sampler reads (done once,
+    not per frame). Azimuth is unwrapped here so every segment lookup stays cheap."""
+    return {
+        "f": [k[0] for k in kfs],
+        "az": _unwrap_seq([k[1] for k in kfs]),
+        "el": [k[2] for k in kfs],
+        "dist": [k[3] for k in kfs],
+    }
+
+
+def _sample_path(path, frame, easing, smooth):
+    """Camera pose (az, el, dist) at a 1-based frame number (1 = first frame).
+
+    Outside the keyframed span the pose is HELD rather than extrapolated, so a
+    path covering only part of the clip simply stops moving -- that is what makes
+    "swing for the first half, then hold" expressible at all.
+
+    Easing is applied per segment, so it reads as a deceleration into each
+    keyframe; combine it with interpolation='linear'. For one continuous flowing
+    move use interpolation='smooth' with easing 'linear', otherwise the eased
+    stop at every knot cancels the smoothing the spline exists to provide."""
+    fs = path["f"]
+    if frame <= fs[0]:
+        return path["az"][0], path["el"][0], path["dist"][0]
+    if frame >= fs[-1]:
+        return path["az"][-1], path["el"][-1], path["dist"][-1]
+
+    seg = 0
+    for i in range(len(fs) - 1):
+        if fs[i] <= frame <= fs[i + 1]:
+            seg = i
+            break
+    u = _ease((frame - fs[seg]) / float(fs[seg + 1] - fs[seg]), easing)
+
+    # Catmull-Rom overshoots between points, so clamp what has a physical limit:
+    # past +-90 elevation the camera tips over the pole, and a distance <= 0 puts
+    # the eye on the far side of the pivot.
+    az = _wrap_deg(_seg_value(path["az"], seg, u, smooth))
+    el = float(np.clip(_seg_value(path["el"], seg, u, smooth), -90.0, 90.0))
+    dist = float(np.clip(_seg_value(path["dist"], seg, u, smooth), 0.2, 3.0))
+    return az, el, dist
+
+
+def _orbit_C_tgt(az_deg, el_deg, dist, pivot):
+    """Camera pose orbiting `pivot` at the requested az/el/dist.
+
+    Mirrors the inline math that was in build(): angle signs are negated so
+    +azimuth = camera orbits RIGHT, +elevation = camera RISES (OpenCV frame)."""
+    R_orbit = _rot_y(np.radians(-az_deg)) @ _rot_x(np.radians(-el_deg))
+    eye = pivot + dist * (R_orbit @ (-pivot))
+    return _look_at(eye, pivot)
+
+
 # --- ComfyUI node ------------------------------------------------------------
 
 class CrossViewWarp:
@@ -338,6 +589,41 @@ class CrossViewWarp:
                     "tooltip": "Pivot depth (how far in front of the camera). ~1.05 sits on the "
                     "nearest subject in the middle of the frame; raise it to orbit around "
                     "something further back."}),
+                # NOTE: new widgets MUST come after the original five optional
+                # ones (roll_lock..pivot_z). ComfyUI stores widget_values
+                # positionally in saved workflows, so inserting a widget in the
+                # middle shifts every downstream value into the wrong slot and
+                # breaks previously saved nodes on load.
+                "use_keyframes": ("BOOLEAN", {"default": False,
+                    "tooltip": "Animate the camera along the 'keyframes' path instead of holding "
+                    "one pose. When OFF, the single azimuth/elevation/distance above is applied to "
+                    "every frame. Right-click the orbit sphere to place keyframes."}),
+                "frame_count": ("INT", {"default": 0, "min": 0, "max": 100000, "step": 1,
+                    "tooltip": "How many frames the clip has, so the sphere knows where the path "
+                    "ends: new keyframes are then spread evenly from frame 1 to the last frame "
+                    "instead of the blind 24-frame default. Hand-edit any frame number in "
+                    "'keyframes' and the even spread stops being re-applied, leaving your timing "
+                    "alone. 0 = off. This is a UI aid - the node always validates keyframes against "
+                    "the clip it actually receives, and logs a warning if that count differs."}),
+                "keyframes": ("STRING", {"default": "", "multiline": False,
+                    "tooltip": "Camera path as JSON, written by right-clicking the orbit sphere - "
+                    "you normally never type in here. Each entry is one keyframe: 'f' = frame number, "
+                    "'az'/'el' = angles in degrees, 'dist' = distance (1.0 = source). Example: "
+                    '[{"f":1,"az":-30,"el":20,"dist":1.0},{"f":49,"az":45,"el":10,"dist":1.2}] . '
+                    "Before the first and after the last keyframe the pose is held, so a path may "
+                    "cover only part of the clip. Empty = no move."}),
+                "interp_motion": (["linear", "ease_in_out", "ease_in", "ease_out"], {"default": "linear",
+                    "tooltip": "Timing between consecutive keyframes. linear = constant speed; "
+                    "ease_in_out = slow start & end (applied per segment, so the camera settles "
+                    "into every keyframe); ease_in / ease_out = one-sided. Pair easing with "
+                    "interpolation='linear' - with 'smooth' it cancels the very continuity the "
+                    "spline provides. Only used when 'use_keyframes' is ON."}),
+                "interpolation": (["linear", "smooth"], {"default": "linear",
+                    "tooltip": "Shape of the path through the keyframes. linear = straight legs "
+                    "with a corner at each keyframe. smooth = Catmull-Rom spline that glides "
+                    "through them with no corner (still passes exactly through every keyframe). "
+                    "With only two keyframes the two are identical. Only used when 'use_keyframes' "
+                    "is ON."}),
             },
         }
 
@@ -353,7 +639,9 @@ class CrossViewWarp:
     CATEGORY = "CrossView"
 
     def build(self, frames, depth, azimuth, elevation, distance, hfov, head_bias, depth_ratio, smooth_depth, invert_depth,
-              roll_lock=True, pivot_override=True, pivot_x=0.0, pivot_y=0.0, pivot_z=1.05):
+              roll_lock=True, pivot_override=True, pivot_x=0.0, pivot_y=0.0, pivot_z=1.05,
+              use_keyframes=False, frame_count=0, keyframes="", interp_motion="linear",
+              interpolation="linear"):
         # frames: [B,H,W,C] float [0,1]; depth: [B,H,W,C] brightness [0,1]
         rgb = (frames.clamp(0, 1).cpu().numpy() * 255.0).astype(np.uint8)   # [B,H,W,3]
         B, H, W = rgb.shape[:3]
@@ -393,11 +681,32 @@ class CrossViewWarp:
             pivot = np.array([pivot_x, pivot_y, pivot_z], dtype=np.float64)
 
         C_ref = np.eye(4)
-        # angles are negated so that + azimuth = camera orbits RIGHT and
-        # + elevation = camera RISES (OpenCV frame: x right, y down, z forward)
-        R_orbit = _rot_y(np.radians(-azimuth)) @ _rot_x(np.radians(-elevation))
-        eye = pivot + distance * (R_orbit @ (-pivot))
-        C_tgt = _look_at(eye, pivot)
+
+        # "Base" pose drives roll-lock estimation AND the orbit_view preview.
+        # For a single-pose run this is just (az, el, dist); for a keyframed
+        # run we use the move's midpoint so the upright correction is the
+        # average of where the camera actually lives across the clip.
+        if use_keyframes and frame_count and frame_count != B:
+            # `frame_count` only tells the widget where to space keyframes; the clip
+            # in hand is the authority. Worth saying out loud, because a stale value
+            # here means the path was laid out for a different length.
+            logging.warning(
+                "CrossViewWarp: frame_count is %d but this clip has %d frames - the camera path "
+                "was spaced for a different length. Update frame_count to re-space new keyframes.",
+                frame_count, B)
+        kfs = _parse_keyframes(keyframes, B) if use_keyframes else []
+        path = _prepare_path(kfs) if kfs else None
+        keyframing = bool(len(kfs) >= 2 and B > 1)
+        smooth_path = (interpolation == "smooth")
+        if keyframing:
+            # middle frame, 1-based: frames run 1..B
+            mid_az, mid_el, mid_dist = _sample_path(path, (B + 1) // 2, interp_motion, smooth_path)
+        elif kfs:
+            # a single keyframe is not a move -- treat it as the static pose
+            mid_az, mid_el, mid_dist = kfs[0][1], kfs[0][2], kfs[0][3]
+        else:
+            mid_az, mid_el, mid_dist = azimuth, elevation, distance
+        C_tgt = _orbit_C_tgt(mid_az, mid_el, mid_dist, pivot)
 
         # roll lock: keep the subject's projected in-image lean identical to
         # the source by rolling the camera about its optical axis (a pitched
@@ -436,6 +745,10 @@ class CrossViewWarp:
 
         th_src = _lean(np.stack([uu[subj].astype(np.float64), vv[subj].astype(np.float64)], -1))
         th_tgt = _lean_in(C_tgt)
+        # roll-lock correction is estimated ONCE at the midpoint pose and the
+        # same scalar `applied_droll` is then applied to every per-frame C_tgt
+        # so the subject stays upright consistently across the whole move.
+        applied_droll = 0.0
         if roll_lock and th_src is not None and th_tgt is not None:
             droll = float(np.clip(_wrap(th_tgt - th_src), -np.radians(35), np.radians(35)))
             err0 = abs(_wrap(th_tgt - th_src))
@@ -444,6 +757,7 @@ class CrossViewWarp:
                 C_try[:3, :3] = _rodrigues(C_tgt[:3, 2], cand) @ C_tgt[:3, :3]
                 th_try = _lean_in(C_try)
                 if th_try is not None and abs(_wrap(th_try - th_src)) < err0 - 1e-6:
+                    applied_droll = cand
                     C_tgt = C_try
                     break
 
@@ -456,13 +770,24 @@ class CrossViewWarp:
         pbar = ProgressBar(B) if ProgressBar is not None else None
         warp_frames = []
         for i in range(B):
-            warp_frames.append(_warp_frame(rgb[i], z[i], C_ref, C_tgt, fx, 2, cx_eff, cy_eff))
+            if keyframing:
+                # i is a 0-based buffer index; keyframes are numbered from 1
+                fr_az, fr_el, fr_dist = _sample_path(path, i + 1, interp_motion, smooth_path)
+                C_tgt_i = _orbit_C_tgt(fr_az, fr_el, fr_dist, pivot)
+                if applied_droll != 0.0:
+                    C_tgt_i = C_tgt_i.copy()
+                    C_tgt_i[:3, :3] = _rodrigues(C_tgt_i[:3, 2], applied_droll) @ C_tgt_i[:3, :3]
+            else:
+                C_tgt_i = C_tgt
+            warp_frames.append(_warp_frame(rgb[i], z[i], C_ref, C_tgt_i, fx, 2, cx_eff, cy_eff))
             if pbar is not None:
                 pbar.update(1)   # advance the node's progress bar one frame
         warp = np.stack(warp_frames, 0)  # [B,H,W,3] uint8
 
         warp_t = torch.from_numpy(warp.astype(np.float32) / 255.0)
-        orbit = _orbit_view_image(azimuth, elevation, distance)
+        # keyframed runs document the whole path; a static run documents the pose
+        orbit = _orbit_view_image(mid_az, mid_el, mid_dist,
+                                  kfs=kfs if keyframing else None, smooth=smooth_path)
         orbit_t = torch.from_numpy(orbit.astype(np.float32) / 255.0)[None]  # [1,H,W,3]
         return (warp_t, orbit_t)
 
