@@ -11,6 +11,9 @@ The node has a built-in 3D orbit picker widget — a sphere around the subject
 where you drag the camera marker instead of typing angles. The green/yellow
 shading on it shows the ranges the LoRA was trained for.
 
+It also does camera *moves*: right-click the sphere to drop keyframes, and the
+node interpolates a pose per frame instead of holding one for the whole clip.
+
 This whole thing is a proof of concept. The LoRA card lists what works and
 what doesn't — read it before expecting magic:
 https://huggingface.co/Cseti/LTX2.3-22B_IC-LoRA-CrossView-Warp
@@ -79,6 +82,9 @@ Key inputs (all have tooltips in the UI):
 - `roll_lock` (default on) — keeps the subject's in-image lean the same as the
   source, so a tilted source shot doesn't tip the character over at large
   angles
+- `use_keyframes` / `keyframes` / `frame_count` / `interp_motion` /
+  `interpolation` — a camera move instead of a single pose. See
+  [Keyframed camera move](#keyframed-camera-move-right-click) below.
 
 ### Keyframed camera move (right-click)
 
@@ -108,12 +114,16 @@ hand — which is currently the way to fine-tune the timing:
 [{"f":1,"az":-30,"el":20,"dist":1.0},{"f":49,"az":45,"el":10,"dist":1.2}]
 ```
 
-`f` is an absolute frame number. Before the first and after the last keyframe
-the camera **holds**, so a path may cover only part of the clip — "swing for the
-first two seconds, then sit still" is just a path that ends early. A keyframe
-past the end of the clip is an error rather than a silently truncated move, so a
-path authored for a longer clip tells you instead of quietly doing the wrong
-thing.
+`f` is an absolute frame number, counted from 1. Before the first and after the
+last keyframe the camera **holds**, so a path may cover only part of the clip —
+"swing for the first two seconds, then sit still" is just a path that ends early.
+A keyframe past the end of the clip is an error rather than a silently truncated
+move, so a path authored for a longer clip tells you instead of quietly doing the
+wrong thing.
+
+`dist` carries the same caveat as the static `distance` above: the current LoRA
+does not follow it reliably, so keyframing a dolly move will disappoint until the
+next release. Angles are what this is good at.
 
 Set `frame_count` to your clip's length and the sphere will spread keyframes
 evenly across it — the last one always lands on the final frame, and adding or

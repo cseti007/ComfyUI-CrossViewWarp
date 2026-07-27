@@ -346,6 +346,14 @@ class OrbitEditor {
     // render dimmed - see markerAlpha in render()). An unreadable string is
     // left alone rather than overwritten, so a hand-edit typo is not silently
     // destroyed by the widget being repainted.
+    // A workflow saved before the orbit canvas stopped serialising itself carries
+    // one extra trailing value, which now lands on use_keyframes and leaves a
+    // boolean toggle holding "". ComfyUI coerces it with bool() at execution, so
+    // mirroring that here keeps the widget showing what the node will actually do
+    // instead of a stray string, until the workflow is re-saved.
+    const wu = getW(this.node, "use_keyframes");
+    if (wu && typeof wu.value !== "boolean") wu.value = !!wu.value;
+
     this._lastKfRaw = getW(this.node, "keyframes")?.value;
     this.kfs = parseKfs(this._lastKfRaw);
     this._lastKfCount = this.kfs.length;
