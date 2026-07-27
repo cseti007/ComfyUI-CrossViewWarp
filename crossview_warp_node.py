@@ -321,7 +321,16 @@ def _look_at(eye, target, world_down=np.array([0.0, 1.0, 0.0])):
     f = target - eye
     f = f / (np.linalg.norm(f) + 1e-9)
     right = np.cross(world_down, f)
-    right = right / (np.linalg.norm(right) + 1e-9)
+    rn = np.linalg.norm(right)
+    if rn < 1e-6:
+        # Looking straight up or down: the view direction is parallel to
+        # world_down, so their cross product carries no direction and the basis
+        # collapses to a singular matrix (which then kills the warp with
+        # "Singular matrix" when it is inverted). Any axis perpendicular to f
+        # gives a valid frame; the world forward axis is the natural pick.
+        right = np.cross(np.array([0.0, 0.0, 1.0]), f)
+        rn = np.linalg.norm(right)
+    right = right / (rn + 1e-9)
     down = np.cross(f, right)
     C = np.eye(4)
     C[:3, 0], C[:3, 1], C[:3, 2], C[:3, 3] = right, down, f, eye
