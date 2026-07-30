@@ -831,15 +831,11 @@ class OrbitEditor {
   }
 }
 
-// DEV-ONLY RENAME - revert both strings before merging into main. The released
-// copy is installed alongside this one, and a duplicate extension name would be
-// skipped by ComfyUI while the old node-name filter would keep the widget from
-// ever attaching to the dev node.
 app.registerExtension({
-  name: "crossview.orbitPicker.dev",
+  name: "crossview.orbitPicker",
   async beforeRegisterNodeDef(nodeType, nodeData) {
-    if (nodeData.name !== "CrossViewWarpDev") return;
-    console.log("[CrossView Orbit DEV] registering widget on CrossViewWarpDev");
+    if (nodeData.name !== "CrossViewWarp") return;
+    console.log("[CrossView Orbit] registering widget on CrossViewWarp");
 
     const onCreated = nodeType.prototype.onNodeCreated;
     nodeType.prototype.onNodeCreated = function () {

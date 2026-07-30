@@ -801,10 +801,5 @@ class CrossViewWarp:
         return (warp_t, orbit_t)
 
 
-# DEV-ONLY RENAME - revert before merging into main.
-# This worktree is installed alongside the released node so the two can be
-# compared in one workflow; sharing the "CrossViewWarp" key would make ComfyUI
-# silently drop one of them. Shipping the renamed id would break every existing
-# workflow, which references the node by this key.
-NODE_CLASS_MAPPINGS = {"CrossViewWarpDev": CrossViewWarp}
-NODE_DISPLAY_NAME_MAPPINGS = {"CrossViewWarpDev": "CrossView Warp DEV (camera_info)"}
+NODE_CLASS_MAPPINGS = {"CrossViewWarp": CrossViewWarp}
+NODE_DISPLAY_NAME_MAPPINGS = {"CrossViewWarp": "CrossView Warp (video -> warp)"}
