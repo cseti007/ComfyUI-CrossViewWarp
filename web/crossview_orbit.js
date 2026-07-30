@@ -849,6 +849,11 @@ app.registerExtension({
       const r = onCreated?.apply(this, arguments);
       try {
         const node = this;
+        // With two copies of the package installed, both register an extension
+        // and both match this node by prefix, so onNodeCreated is wrapped twice
+        // and the canvas would be added twice. Cheap guard, and it makes the
+        // widget idempotent in general.
+        if (node.widgets?.some((w) => w.name === "orbit")) return r;
         const container = document.createElement("div");
         container.style.width = "100%";
         const canvas = document.createElement("canvas");
