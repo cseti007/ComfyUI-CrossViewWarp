@@ -14,9 +14,20 @@ consistency and re-centred so an off-centre subject stays framed.
 
 import json
 import logging
+from pathlib import Path
 
 import numpy as np
 import torch
+
+# Optional local suffix for the node id, read from an untracked `.node_suffix`
+# file next to this module. It lets a second copy of this package (a dev
+# worktree symlinked into custom_nodes beside the released one) register under
+# its own id, so both can be dropped into one workflow and compared. Users never
+# have the file, so the id is unchanged for them and nothing needs reverting
+# before a release - which is the point: an edit that must be undone by hand
+# eventually ships by accident.
+_sfx = Path(__file__).parent / ".node_suffix"
+NODE_SUFFIX = _sfx.read_text().strip() if _sfx.exists() else ""
 
 try:
     from comfy.utils import ProgressBar   # ComfyUI runtime: drives the node's progress bar
@@ -801,5 +812,7 @@ class CrossViewWarp:
         return (warp_t, orbit_t)
 
 
-NODE_CLASS_MAPPINGS = {"CrossViewWarp": CrossViewWarp}
-NODE_DISPLAY_NAME_MAPPINGS = {"CrossViewWarp": "CrossView Warp (video -> warp)"}
+_ID = f"CrossViewWarp{NODE_SUFFIX}"
+_NAME = "CrossView Warp (video -> warp)" + (f" [{NODE_SUFFIX}]" if NODE_SUFFIX else "")
+NODE_CLASS_MAPPINGS = {_ID: CrossViewWarp}
+NODE_DISPLAY_NAME_MAPPINGS = {_ID: _NAME}

@@ -831,11 +831,18 @@ class OrbitEditor {
   }
 }
 
+// Two copies of this package can be installed side by side (a dev worktree next
+// to the release, see .node_suffix in crossview_warp_node.py). Extension names
+// must be unique or the second registration is dropped, so derive one from the
+// directory this module was served from; and match the node by PREFIX so the
+// widget attaches to a suffixed dev id as well.
+const PKG = (import.meta.url.match(/\/extensions\/([^/]+)\//) || [, "core"])[1];
+
 app.registerExtension({
-  name: "crossview.orbitPicker",
+  name: `crossview.orbitPicker.${PKG}`,
   async beforeRegisterNodeDef(nodeType, nodeData) {
-    if (nodeData.name !== "CrossViewWarp") return;
-    console.log("[CrossView Orbit] registering widget on CrossViewWarp");
+    if (!nodeData.name.startsWith("CrossViewWarp")) return;
+    console.log(`[CrossView Orbit] registering widget on ${nodeData.name}`);
 
     const onCreated = nodeType.prototype.onNodeCreated;
     nodeType.prototype.onNodeCreated = function () {
