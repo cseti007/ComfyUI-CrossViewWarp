@@ -608,9 +608,6 @@ class CrossViewWarp:
                 "frames": ("IMAGE", {
                     "tooltip": "Input video frames (the source view). Feed the same "
                     "frames you send to the Depth Anything V2 node."}),
-                "depth": ("IMAGE", {
-                    "tooltip": "Depth map for the SAME frames, from a Depth Anything V2 node "
-                    "(DA-V2 Large). Brightness = depth; polarity is handled by invert_depth."}),
                 "azimuth": ("FLOAT", {"default": -30.0, "min": -180.0, "max": 180.0, "step": 1.0,
                     "tooltip": "Horizontal orbit angle (deg). Negative = camera orbits LEFT, "
                     "positive = RIGHT. The strongest control. Reliable up to about +-45, usable "
@@ -623,7 +620,7 @@ class CrossViewWarp:
                     "tooltip": "Camera distance from the subject (1.0 = same as source). "
                     "Below 1 = move closer / zoom in; above 1 = pull back. Extreme values "
                     "enlarge the disoccluded (magenta) holes."}),
-                "hfov": ("FLOAT", {"default": 50.0, "min": 20.0, "max": 120.0, "step": 1.0,
+                "hfov": ("FLOAT", {"default": 50.0, "min": 0.0, "max": 120.0, "step": 1.0,
                     "tooltip": "Assumed camera field of view (deg). ~50 is a normal lens. Only "
                     "change it if your source clip is clearly wide-angle or telephoto."}),
                 "head_bias": ("FLOAT", {"default": 0.0, "min": -0.5, "max": 0.5, "step": 0.02,
@@ -695,8 +692,24 @@ class CrossViewWarp:
                     "through them with no corner (still passes exactly through every keyframe). "
                     "With only two keyframes the two are identical. Only used when 'use_keyframes' "
                     "is ON."}),
-                # A socket, not a widget, so it does not take a widget_values
-                # slot and cannot shift the ones above in saved workflows.
+                # Sockets, not widgets, so they take no widget_values slot and
+                # cannot shift the ones above in saved workflows. `depth` moved
+                # here from `required` so a metric-geometry graph does not have
+                # to wire a depth image it will not use; saved workflows already
+                # have it connected, so nothing breaks.
+                "depth": ("IMAGE", {
+                    "tooltip": "Depth map for the SAME frames, from a Depth Anything V2 node "
+                    "(DA-V2 Large). Brightness = depth; polarity is handled by invert_depth. "
+                    "Leave unconnected if you are feeding moge_geometry instead."}),
+                "moge_geometry": ("MOGE_GEOMETRY", {
+                    "tooltip": "Metric geometry from Run MoGe Inference, used INSTEAD of the "
+                    "depth image. Depth then arrives in real metres, so depth_ratio and "
+                    "invert_depth are ignored - there is no relief to guess and no polarity to "
+                    "flip - and pivot/distance become real distances. Measured against ground "
+                    "truth this roughly halves the warp error versus a relative depth map, "
+                    "because a relative map has no scale and the guessed one is usually wrong. "
+                    "hfov is taken from its intrinsics when hfov is 0, but MoGe estimates the "
+                    "focal ~10% short, so set hfov yourself if you know the lens."}),
                 "camera_info": ("LOAD3D_CAMERA", {
                     "tooltip": "Exact target camera, from Create Camera Info or a Load 3D "
                     "viewport. When connected the pose is taken from it and azimuth, elevation, "
@@ -718,15 +731,33 @@ class CrossViewWarp:
     FUNCTION = "build"
     CATEGORY = "CrossView"
 
-    def build(self, frames, depth, azimuth, elevation, distance, hfov, head_bias, depth_ratio, smooth_depth, invert_depth,
+    def build(self, frames, azimuth, elevation, distance, hfov, head_bias, depth_ratio, smooth_depth, invert_depth,
               roll_lock=True, pivot_override=True, pivot_x=0.0, pivot_y=0.0, pivot_z=1.05,
               use_keyframes=False, frame_count=0, keyframes="", interp_motion="linear",
-              interpolation="linear", camera_info=None):
+              interpolation="linear", camera_info=None, moge_geometry=None, depth=None):
         # frames: [B,H,W,C] float [0,1]; depth: [B,H,W,C] brightness [0,1]
         rgb = (frames.clamp(0, 1).cpu().numpy() * 255.0).astype(np.uint8)   # [B,H,W,3]
         B, H, W = rgb.shape[:3]
-        depth_bhw = depth.clamp(0, 1).mean(dim=-1).cpu().numpy()            # brightness
-        if smooth_depth:
+        if moge_geometry is None and depth is None:
+            raise ValueError("CrossViewWarp: connect either `depth` (a depth image) or "
+                             "`moge_geometry` (metric geometry from Run MoGe Inference).")
+        metric_z = None
+        if moge_geometry is not None:
+            # Metric metres straight from the model - no normalisation, so no
+            # scale to guess. `mask` marks sky/invalid, which becomes a hole
+            # rather than being clamped into the far plane by the percentile cut.
+            md = moge_geometry.get("depth")
+            metric_z = md.detach().float().cpu().numpy()
+            mm = moge_geometry.get("mask")
+            if mm is not None:
+                metric_z = np.where(mm.detach().cpu().numpy(), metric_z, np.nan)
+            metric_z = np.where(np.isfinite(metric_z) & (metric_z > 0), metric_z, np.nan)
+            if depth is not None:
+                logging.warning("CrossViewWarp: both depth and moge_geometry are connected; "
+                                "using moge_geometry (metric) and ignoring the depth image.")
+        depth_bhw = (depth.clamp(0, 1).mean(dim=-1).cpu().numpy()
+                     if metric_z is None else metric_z)
+        if smooth_depth and metric_z is None:
             # edge-aware smoothing: median kills salt noise, the RGB-guided
             # filter re-aligns depth edges to image edges -> neighbouring
             # pixels land adjacently in the warp = coherent holes (see tooltip)
@@ -738,9 +769,20 @@ class CrossViewWarp:
                 except Exception:
                     d32 = cv2.bilateralFilter(d32, 9, 0.1, 9.0)
                 depth_bhw[i] = d32
-        z = _depth_to_z(depth_bhw, invert_depth, depth_ratio)              # [B,H,W]
+        # metric depth IS z; the mapping exists only to invent a scale for a
+        # relative map, so applying it here would throw the metres away
+        z = metric_z if metric_z is not None else _depth_to_z(depth_bhw, invert_depth, depth_ratio)
 
-        fx = W / (2.0 * np.tan(np.radians(hfov) / 2.0))
+        fx = W / (2.0 * np.tan(np.radians(hfov) / 2.0)) if hfov > 0 else None
+        if fx is None:
+            # hfov 0 = take it from MoGe's own intrinsics. Measured: MoGe runs
+            # about 10% short on focal, so this is the fallback, not the default
+            # choice - a known lens beats it.
+            K = (moge_geometry or {}).get("intrinsics")
+            fx = (float(K[0][0, 0]) * W if K is not None
+                  else W / (2.0 * np.tan(np.radians(50.0) / 2.0)))
+            logging.info("CrossViewWarp: hfov=0, using fx=%.1f px (%.1f deg)", fx,
+                         np.degrees(2 * np.arctan(W / (2 * fx))))
         cc = W / 2.0
         cch = H / 2.0
 
