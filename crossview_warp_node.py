@@ -621,8 +621,11 @@ class CrossViewWarp:
                     "Below 1 = move closer / zoom in; above 1 = pull back. Extreme values "
                     "enlarge the disoccluded (magenta) holes."}),
                 "hfov": ("FLOAT", {"default": 50.0, "min": 0.0, "max": 120.0, "step": 1.0,
-                    "tooltip": "Assumed camera field of view (deg). ~50 is a normal lens. Only "
-                    "change it if your source clip is clearly wide-angle or telephoto."}),
+                    "tooltip": "Assumed HORIZONTAL camera field of view (deg). ~50 is a normal "
+                    "lens; change it if the clip is clearly wide-angle or telephoto. "
+                    "0 = read the focal length from moge_geometry's intrinsics instead - a "
+                    "fallback, not the better choice, since MoGe estimates the focal about 10% "
+                    "short. With no moge_geometry connected, 0 falls back to 50."}),
                 "head_bias": ("FLOAT", {"default": 0.0, "min": -0.5, "max": 0.5, "step": 0.02,
                     "tooltip": "Manual vertical framing shift (fraction of height; + = shift the "
                     "view up). Leave at 0 unless the subject's head gets clipped."}),
