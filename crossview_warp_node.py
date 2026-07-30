@@ -537,6 +537,57 @@ def _sample_path(path, frame, easing, smooth):
     return az, el, dist
 
 
+def _quat_to_mat_xyzw(q):
+    """Unit quaternion (x, y, z, w) -> rotation matrix, columns = rotated axes."""
+    x, y, z, w = (float(c) for c in q)
+    n = (x * x + y * y + z * z + w * w) ** 0.5
+    if n < 1e-9:
+        return np.eye(3)
+    x, y, z, w = x / n, y / n, z / n, w / n
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ])
+
+
+# three.js world/camera (Y up, camera looks down -Z) -> this node's frame, which
+# is OpenCV-style (y down, +z forward) because _warp_frame unprojects with
+# [(u-cx)/fx*z, (v-cy)/fx*z, z]. Flipping y and z converts both the point and
+# the camera basis; it is a rotation (det +1), not a mirror.
+_T3 = np.diag([1.0, -1.0, -1.0])
+
+
+def _camera_info_pose(ci, height):
+    """Load3DCamera dict -> (C_tgt 4x4 in this node's frame, fx in pixels).
+
+    Removes the pose ESTIMATION entirely: instead of orbiting an guessed pivot,
+    the camera goes exactly where the caller put it. `fov` in a camera_info is
+    VERTICAL and `zoom` multiplies the focal length, unlike this node's
+    horizontal `hfov`.
+    """
+    g = lambda d, k: float((d or {}).get(k, 0.0) or 0.0)
+    eye3 = np.array([g(ci.get("position"), "x"), g(ci.get("position"), "y"),
+                     g(ci.get("position"), "z")])
+    q = ci.get("quaternion")
+    if q:                                   # exact world rotation, roll included
+        R3 = _quat_to_mat_xyzw((g(q, "x"), g(q, "y"), g(q, "z"),
+                               float((q or {}).get("w", 1.0) or 1.0)))
+    else:                                   # only a look-at target: no roll info
+        tgt3 = np.array([g(ci.get("target"), "x"), g(ci.get("target"), "y"),
+                         g(ci.get("target"), "z")])
+        return _look_at(_T3 @ eye3, _T3 @ tgt3), None
+    C = np.eye(4)
+    # columns are (right, up, backward) in three.js; this node wants
+    # (right, down, forward), hence the second flip on the right
+    C[:3, :3] = _T3 @ R3 @ np.diag([1.0, -1.0, -1.0])
+    C[:3, 3] = _T3 @ eye3
+    vfov = float(ci.get("fov") or 0.0) or 35.0
+    zoom = float(ci.get("zoom") or 1.0) or 1.0
+    fx = height / (2.0 * np.tan(np.radians(vfov) / 2.0)) * zoom   # square pixels
+    return C, fx
+
+
 def _orbit_C_tgt(az_deg, el_deg, dist, pivot):
     """Camera pose orbiting `pivot` at the requested az/el/dist.
 
@@ -644,6 +695,15 @@ class CrossViewWarp:
                     "through them with no corner (still passes exactly through every keyframe). "
                     "With only two keyframes the two are identical. Only used when 'use_keyframes' "
                     "is ON."}),
+                # A socket, not a widget, so it does not take a widget_values
+                # slot and cannot shift the ones above in saved workflows.
+                "camera_info": ("LOAD3D_CAMERA", {
+                    "tooltip": "Exact target camera, from Create Camera Info or a Load 3D "
+                    "viewport. When connected the pose is taken from it and azimuth, elevation, "
+                    "distance, roll_lock, the pivot_* fields and the keyframe path are ALL "
+                    "IGNORED - the camera is placed where the camera_info says, instead of being "
+                    "derived from an orbit around an estimated pivot. hfov is ignored too: the "
+                    "focal length comes from the camera_info's own (vertical) fov and zoom."}),
             },
         }
 
@@ -661,7 +721,7 @@ class CrossViewWarp:
     def build(self, frames, depth, azimuth, elevation, distance, hfov, head_bias, depth_ratio, smooth_depth, invert_depth,
               roll_lock=True, pivot_override=True, pivot_x=0.0, pivot_y=0.0, pivot_z=1.05,
               use_keyframes=False, frame_count=0, keyframes="", interp_motion="linear",
-              interpolation="linear"):
+              interpolation="linear", camera_info=None):
         # frames: [B,H,W,C] float [0,1]; depth: [B,H,W,C] brightness [0,1]
         rgb = (frames.clamp(0, 1).cpu().numpy() * 255.0).astype(np.uint8)   # [B,H,W,3]
         B, H, W = rgb.shape[:3]
@@ -683,6 +743,20 @@ class CrossViewWarp:
         fx = W / (2.0 * np.tan(np.radians(hfov) / 2.0))
         cc = W / 2.0
         cch = H / 2.0
+
+        # An explicit camera_info replaces the whole pose ESTIMATION - pivot,
+        # orbit and roll lock all exist only to guess a pose from angles, and
+        # measured against ground truth that guess is what costs this node most
+        # of its accuracy. When one is supplied the camera simply goes where it
+        # says.
+        ci_C = ci_fx = None
+        if camera_info:
+            ci_C, ci_fx = _camera_info_pose(camera_info, H)
+            if ci_fx:
+                fx = ci_fx
+            if use_keyframes:
+                logging.warning("CrossViewWarp: camera_info is connected, so the keyframe "
+                                "path is ignored - the pose comes from camera_info.")
 
         # subject pivot = central-region foreground centroid on frame 0
         z0 = z[0]
@@ -716,7 +790,7 @@ class CrossViewWarp:
                 frame_count, B)
         kfs = _parse_keyframes(keyframes, B) if use_keyframes else []
         path = _prepare_path(kfs) if kfs else None
-        keyframing = bool(len(kfs) >= 2 and B > 1)
+        keyframing = bool(len(kfs) >= 2 and B > 1) and ci_C is None
         smooth_path = (interpolation == "smooth")
         if keyframing:
             # middle frame, 1-based: frames run 1..B
@@ -726,7 +800,7 @@ class CrossViewWarp:
             mid_az, mid_el, mid_dist = kfs[0][1], kfs[0][2], kfs[0][3]
         else:
             mid_az, mid_el, mid_dist = azimuth, elevation, distance
-        C_tgt = _orbit_C_tgt(mid_az, mid_el, mid_dist, pivot)
+        C_tgt = ci_C if ci_C is not None else _orbit_C_tgt(mid_az, mid_el, mid_dist, pivot)
 
         # roll lock: keep the subject's projected in-image lean identical to
         # the source by rolling the camera about its optical axis (a pitched
@@ -769,7 +843,10 @@ class CrossViewWarp:
         # same scalar `applied_droll` is then applied to every per-frame C_tgt
         # so the subject stays upright consistently across the whole move.
         applied_droll = 0.0
-        if roll_lock and th_src is not None and th_tgt is not None:
+        # roll_lock corrects a roll that the orbit construction introduces. An
+        # explicit camera_info already carries the roll the caller asked for, so
+        # "fixing" it would silently override them.
+        if roll_lock and ci_C is None and th_src is not None and th_tgt is not None:
             droll = float(np.clip(_wrap(th_tgt - th_src), -np.radians(35), np.radians(35)))
             err0 = abs(_wrap(th_tgt - th_src))
             for cand in (droll, -droll):
