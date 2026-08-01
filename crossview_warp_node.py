@@ -38,7 +38,7 @@ MAGENTA = np.array([255, 0, 255], dtype=np.uint8)
 
 
 def _dist_scale(d):
-    """Map source-distance ratio (0.2..3.0) to a canvas radius multiplier.
+    """Map source-distance ratio (0.1..3.0) to a canvas radius multiplier.
 
     Piecewise so dist=1.0 lands exactly on the shell (multiplier 1.0):
     dist<=1 spreads 0.45..1.0 (inside the shell = closer), dist>1 spreads
@@ -541,7 +541,7 @@ def _sample_path(path, frame, easing, smooth):
     # the eye on the far side of the pivot.
     az = _wrap_deg(_seg_value(path["az"], seg, u, smooth))
     el = float(np.clip(_seg_value(path["el"], seg, u, smooth), -90.0, 90.0))
-    dist = float(np.clip(_seg_value(path["dist"], seg, u, smooth), 0.2, 3.0))
+    dist = float(np.clip(_seg_value(path["dist"], seg, u, smooth), 0.1, 3.0))
     return az, el, dist
 
 
@@ -659,7 +659,7 @@ class CrossViewWarp:
                     "tooltip": "Vertical orbit angle (deg). Positive = camera rises (looks down "
                     "on the subject), negative = looks up. NOTE: the effect is weaker/subtler "
                     "than azimuth - the orbit is stronger horizontally."}),
-                "distance": ("FLOAT", {"default": 1.0, "min": 0.2, "max": 3.0, "step": 0.05,
+                "distance": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 3.0, "step": 0.05,
                     "tooltip": "Camera distance from the subject (1.0 = same as source). "
                     "Below 1 = move closer / zoom in; above 1 = pull back. Extreme values "
                     "enlarge the disoccluded (magenta) holes."}),

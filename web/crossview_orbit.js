@@ -10,7 +10,7 @@
 // the training dataset uses. Interactions:
 //   - drag the camera handle  -> set azimuth/elevation (snaps to 5 deg)
 //   - drag empty space        -> rotate the VIEW (arcball)
-//   - mouse wheel             -> distance (0.2..3.0), or a hovered keyframe's
+//   - mouse wheel             -> distance (0.1..3.0), or a hovered keyframe's
 //   - double click            -> reset the view rotation
 //   - RIGHT-CLICK             -> place a keyframe, or delete the one clicked
 // For a static pose the azimuth/elevation/distance number widgets stay the
@@ -623,7 +623,7 @@ class OrbitEditor {
     // Wheel back (deltaY > 0) raises the number, wheel forward lowers it - the
     // same direction as every other numeric widget in the graph.
     const step = Math.sign(e.deltaY) * 0.05;
-    const clampDist = (v) => Math.max(0.2, Math.min(3.0, Math.round(v * 100) / 100));
+    const clampDist = (v) => Math.max(0.1, Math.min(3.0, Math.round(v * 100) / 100));
 
     // Hovering a keyframe dollies THAT keyframe; anywhere else dollies the
     // static camera. Both use the drawn marker position (see pickKf).
