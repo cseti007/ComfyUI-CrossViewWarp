@@ -262,7 +262,7 @@ def _orbit_view_image(azimuth, elevation, distance, size=512, kfs=None, smooth=F
                                width=max(2, round(2.5 * k)))
                     prev = (x1, y1)
 
-        for f_no, kaz, kel, kdist in kfs:
+        for f_no, kaz, kel, kdist, _kvs in kfs:
             kx, ky, kfront = pt(kaz, kel)
             distFk = _dist_scale(kdist)
             kpx, kpy = cx + (kx - cx) * distFk, cy + (ky - cy) * distFk
@@ -447,8 +447,12 @@ def _seg_value(vals, seg, u, smooth):
     return _catmull(p0, p1, p2, p3, u)
 
 
-def _parse_keyframes(raw, frame_count):
-    """Parse the `keyframes` widget into a sorted [(frame, az, el, dist), ...].
+def _parse_keyframes(raw, frame_count, default_vs=0.0):
+    """Parse the `keyframes` widget into a sorted [(frame, az, el, dist, vs), ...].
+
+    "vs" (vertical lens shift) is OPTIONAL: a keyframe without one inherits
+    `default_vs`, the node's static widget. A path written before vs existed
+    therefore gives every keyframe the same value, which is what it used to do.
 
     Frame numbers are 1-based, matching how the clip reads to a user (frame 1 is
     the first frame, frame `frame_count` the last); the loop in build() converts.
@@ -479,6 +483,7 @@ def _parse_keyframes(raw, frame_count):
         try:
             f = int(round(float(kf["f"])))
             az, el, dist = float(kf["az"]), float(kf["el"]), float(kf["dist"])
+            vs = float(kf.get("vs", default_vs))
         except (KeyError, TypeError, ValueError):
             raise ValueError(
                 "CrossViewWarp: keyframe #%d needs numeric 'f', 'az', 'el' and 'dist'." % i
@@ -492,7 +497,7 @@ def _parse_keyframes(raw, frame_count):
                 "CrossViewWarp: keyframe #%d sits at frame %d, but this clip only has %d frames. "
                 "The camera path was authored for a longer clip -- move that keyframe, or feed a "
                 "longer clip." % (i, f, frame_count))
-        out.append((f, az, el, dist))
+        out.append((f, az, el, dist, vs))
 
     out.sort(key=lambda k: k[0])
     seen = [k[0] for k in out]
@@ -509,11 +514,12 @@ def _prepare_path(kfs):
         "az": _unwrap_seq([k[1] for k in kfs]),
         "el": [k[2] for k in kfs],
         "dist": [k[3] for k in kfs],
+        "vs": [k[4] for k in kfs],
     }
 
 
 def _sample_path(path, frame, easing, smooth):
-    """Camera pose (az, el, dist) at a 1-based frame number (1 = first frame).
+    """Camera pose (az, el, dist, vertical_shift) at a 1-based frame number.
 
     Outside the keyframed span the pose is HELD rather than extrapolated, so a
     path covering only part of the clip simply stops moving -- that is what makes
@@ -525,9 +531,9 @@ def _sample_path(path, frame, easing, smooth):
     stop at every knot cancels the smoothing the spline exists to provide."""
     fs = path["f"]
     if frame <= fs[0]:
-        return path["az"][0], path["el"][0], path["dist"][0]
+        return path["az"][0], path["el"][0], path["dist"][0], path["vs"][0]
     if frame >= fs[-1]:
-        return path["az"][-1], path["el"][-1], path["dist"][-1]
+        return path["az"][-1], path["el"][-1], path["dist"][-1], path["vs"][-1]
 
     seg = 0
     for i in range(len(fs) - 1):
@@ -542,7 +548,8 @@ def _sample_path(path, frame, easing, smooth):
     az = _wrap_deg(_seg_value(path["az"], seg, u, smooth))
     el = float(np.clip(_seg_value(path["el"], seg, u, smooth), -90.0, 90.0))
     dist = float(np.clip(_seg_value(path["dist"], seg, u, smooth), 0.1, 3.0))
-    return az, el, dist
+    vs = float(np.clip(_seg_value(path["vs"], seg, u, smooth), -1.0, 1.0))
+    return az, el, dist, vs
 
 
 def _quat_to_mat_xyzw(q):
@@ -920,18 +927,19 @@ class CrossViewWarp:
                 "CrossViewWarp: frame_count is %d but this clip has %d frames - the camera path "
                 "was spaced for a different length. Update frame_count to re-space new keyframes.",
                 frame_count, B)
-        kfs = _parse_keyframes(keyframes, B) if use_keyframes else []
+        kfs = _parse_keyframes(keyframes, B, vertical_shift) if use_keyframes else []
         path = _prepare_path(kfs) if kfs else None
         keyframing = bool(len(kfs) >= 2 and B > 1) and ci_C is None
         smooth_path = (interpolation == "smooth")
         if keyframing:
             # middle frame, 1-based: frames run 1..B
-            mid_az, mid_el, mid_dist = _sample_path(path, (B + 1) // 2, interp_motion, smooth_path)
+            mid_az, mid_el, mid_dist, mid_vs = _sample_path(
+                path, (B + 1) // 2, interp_motion, smooth_path)
         elif kfs:
             # a single keyframe is not a move -- treat it as the static pose
-            mid_az, mid_el, mid_dist = kfs[0][1], kfs[0][2], kfs[0][3]
+            mid_az, mid_el, mid_dist, mid_vs = kfs[0][1], kfs[0][2], kfs[0][3], kfs[0][4]
         else:
-            mid_az, mid_el, mid_dist = azimuth, elevation, distance
+            mid_az, mid_el, mid_dist, mid_vs = azimuth, elevation, distance, vertical_shift
         C_tgt = ci_C if ci_C is not None else _orbit_C_tgt(mid_az, mid_el, mid_dist, pivot, aim)
 
         # roll lock: keep the subject's projected in-image lean identical to
@@ -995,21 +1003,28 @@ class CrossViewWarp:
         # shift only (default 0 = off) - it translates the rendered frame and
         # leaves the camera where it is, so it cannot change parallax
         cx_eff = cc
-        cy_eff = cch + vertical_shift * H
+        # mid_vs is the static widget when no path is running, so this is
+        # unchanged for an ordinary run; a keyframed one overrides it per frame.
+        cy_eff = cch + mid_vs * H
 
         pbar = ProgressBar(B) if ProgressBar is not None else None
         warp_frames = []
         for i in range(B):
             if keyframing:
                 # i is a 0-based buffer index; keyframes are numbered from 1
-                fr_az, fr_el, fr_dist = _sample_path(path, i + 1, interp_motion, smooth_path)
+                fr_az, fr_el, fr_dist, fr_vs = _sample_path(
+                    path, i + 1, interp_motion, smooth_path)
                 C_tgt_i = _orbit_C_tgt(fr_az, fr_el, fr_dist, pivot, aim)
                 if applied_droll != 0.0:
                     C_tgt_i = C_tgt_i.copy()
                     C_tgt_i[:3, :3] = _rodrigues(C_tgt_i[:3, 2], applied_droll) @ C_tgt_i[:3, :3]
+                # the lens shift is part of the framing, so it keyframes with the
+                # rest of the pose rather than staying pinned to the widget
+                cy_i = cch + fr_vs * H
             else:
                 C_tgt_i = C_tgt
-            warp_frames.append(_warp_frame(rgb[i], z[i], C_ref, C_tgt_i, fx, 2, cx_eff, cy_eff))
+                cy_i = cy_eff
+            warp_frames.append(_warp_frame(rgb[i], z[i], C_ref, C_tgt_i, fx, 2, cx_eff, cy_i))
             if pbar is not None:
                 pbar.update(1)   # advance the node's progress bar one frame
         warp = np.stack(warp_frames, 0)  # [B,H,W,3] uint8

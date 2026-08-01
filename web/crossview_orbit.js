@@ -153,8 +153,12 @@ function parseKfs(raw) {
   for (const kf of data) {
     if (!kf || typeof kf !== "object") continue;
     const f = Number(kf.f), az = Number(kf.az), el = Number(kf.el), dist = Number(kf.dist);
+    // `vs` is the per-keyframe vertical lens shift, authored on the live
+    // preview's playhead. This sphere has no control for it, but it must be
+    // carried through or editing a path here would silently erase it.
+    const vs = kf.vs === undefined ? undefined : Number(kf.vs);
     if (![f, az, el, dist].every(Number.isFinite)) continue;
-    out.push({ f: Math.round(f), az, el, dist });
+    out.push({ f: Math.round(f), az, el, dist, ...(vs === undefined ? {} : { vs }) });
   }
   out.sort((a, b) => a.f - b.f);
   return out;
@@ -437,6 +441,7 @@ class OrbitEditor {
       w.value = this.kfs.length
         ? JSON.stringify(this.kfs.map((k) => ({
             f: k.f, az: round1(k.az), el: round1(k.el), dist: round2(k.dist),
+            ...(k.vs === undefined || !Number.isFinite(k.vs) ? {} : { vs: round2(k.vs) }),
           })))
         : "";
       this._lastKfRaw = w.value;   // our own write must not look like a hand-edit
