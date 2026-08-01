@@ -371,6 +371,16 @@ class OrbitEditor {
   // A computed upstream only produces its string on the server at execution time,
   // so there is genuinely nothing to preview — say so rather than show a stale
   // local value.
+  // camera_info is a plain socket rather than a converted widget, so it is
+  // matched by input name. When it is wired the node takes its pose from there
+  // and ignores azimuth/elevation/distance, the pivot and the keyframe path
+  // entirely - the sphere would otherwise keep drawing a camera that has no
+  // bearing on the render. Its value only exists at execution time, so this can
+  // report THAT it is driven from outside but never where the camera ended up;
+  // the orbit_view output image shows that.
+  _cameraInfoLinked() {
+    return this.node.inputs?.some((i) => i.name === "camera_info" && i.link != null) === true;
+  }
   _keyframeSource() {
     const inp = this.node.inputs?.find((i) => i.widget?.name === "keyframes");
     if (inp?.link == null) return { linked: false, kfs: null };
@@ -387,6 +397,7 @@ class OrbitEditor {
   // Re-read the widgets every frame so hand-edits to the `keyframes` string and
   // the interpolation / use_keyframes toggles show up on the sphere.
   _syncFromWidgets() {
+    this.camLinked = this._cameraInfoLinked();
     const src = this._keyframeSource();
     this.linked = src.linked;
     this.linkedUnknown = src.linked && src.kfs === null;
@@ -652,7 +663,7 @@ class OrbitEditor {
     this._syncFromWidgets();
     const { az, el, dist } = this.vals();
     const g = this.geom();
-    const kfKey = `${this.kfs.map((k) => `${k.f},${k.az.toFixed(1)},${k.el.toFixed(1)},${k.dist.toFixed(2)}`).join(";")}|${this.smoothPath ? 1 : 0}|${this.useKeyframes ? 1 : 0}|${this.linked ? 1 : 0}${this.linkedUnknown ? "?" : ""}`;
+    const kfKey = `${this.kfs.map((k) => `${k.f},${k.az.toFixed(1)},${k.el.toFixed(1)},${k.dist.toFixed(2)}`).join(";")}|${this.smoothPath ? 1 : 0}|${this.useKeyframes ? 1 : 0}|${this.linked ? 1 : 0}${this.linkedUnknown ? "?" : ""}|${this.camLinked ? 1 : 0}`;
     const key = `${az}|${el}|${dist}|${this.view.viewYaw.toFixed(3)}|${this.view.viewTilt.toFixed(3)}|${kfKey}|${this.canvas.width}x${this.canvas.height}`;
     if (!force && key === this._renderKey) return;
     this._renderKey = key;
@@ -710,6 +721,11 @@ class OrbitEditor {
     // blue one sitting under the green frame-0 marker it was seeded from. So in
     // keyframe mode the whole static-camera overlay is skipped and the green
     // path is the only camera indicator.
+    // A camera_info pose overrides everything the sphere shows, so the overlay
+    // drops to a ghost: still legible as a setup, clearly not in charge. Applied
+    // as a factor because the block below assigns globalAlpha itself.
+    const camDim = this.camLinked ? 0.25 : 1.0;
+    ctx.globalAlpha = camDim;
     if (!this.useKeyframes) {
       // arc home -> camera
       ctx.strokeStyle = "#78beff"; ctx.lineWidth = 2.5;
@@ -736,7 +752,7 @@ class OrbitEditor {
       ctx.strokeStyle = "rgba(255,255,255,0.6)";
       ctx.beginPath(); ctx.arc(sx, sy, 3, 0, Math.PI * 2); ctx.stroke();  // 1.0x tick
       this.handle = [px, py];
-      ctx.globalAlpha = pf < 0 ? 1.0 : 0.45;
+      ctx.globalAlpha = (pf < 0 ? 1.0 : 0.45) * camDim;
       ctx.strokeStyle = "#78beff"; ctx.lineWidth = 1;
       for (const [dx, dy] of [[-8, -6], [8, -6], [-8, 6], [8, 6]]) {
         ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(g.cx + dx, g.cy + dy - 6); ctx.stroke();
@@ -759,7 +775,7 @@ class OrbitEditor {
     // spacing on screen shows shape only — the timing lives in each keyframe's
     // frame number. markerAlpha dims the overlay to 20% when use_keyframes is
     // OFF, so placements persist visually but read as disabled.
-    const markerAlpha = this.useKeyframes ? 1.0 : 0.2;
+    const markerAlpha = (this.useKeyframes ? 1.0 : 0.2) * camDim;
     this.kfPos = [];
     if (this.kfs.length >= 2) {
       const azU = unwrapSeq(this.kfs.map((k) => k.az));
@@ -819,12 +835,15 @@ class OrbitEditor {
     // nothing to preview either — better to admit that than to leave a confident
     // but wrong picture on screen. Otherwise the right-click hint, which retires
     // once the first keyframe exists.
+    ctx.globalAlpha = 1.0;
     let hint = null;
-    if (this.linkedUnknown) hint = "keyframes: driven by input (value known at run time)";
+    if (this.camLinked) hint = "camera from camera_info input - these controls are ignored";
+    else if (this.linkedUnknown) hint = "keyframes: driven by input (value known at run time)";
     else if (this.linked) hint = "keyframes: driven by input - preview only";
     else if (!this.kfs.length) hint = "right-click: add camera keyframe";
     if (hint) {
-      ctx.fillStyle = this.linkedUnknown ? "rgba(230,200,90,0.75)" : "rgba(200,204,216,0.45)";
+      ctx.fillStyle = (this.camLinked || this.linkedUnknown)
+        ? "rgba(230,200,90,0.75)" : "rgba(200,204,216,0.45)";
       ctx.font = "11px monospace";
       ctx.fillText(hint, (W - ctx.measureText(hint).width) / 2, H - 8);
     }
