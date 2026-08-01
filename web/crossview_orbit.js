@@ -620,7 +620,9 @@ class OrbitEditor {
   onWheel(e) {
     e.preventDefault(); e.stopPropagation();
     const [mx, my] = this.canvasPos(e);
-    const step = -Math.sign(e.deltaY) * 0.05;
+    // Wheel back (deltaY > 0) raises the number, wheel forward lowers it - the
+    // same direction as every other numeric widget in the graph.
+    const step = Math.sign(e.deltaY) * 0.05;
     const clampDist = (v) => Math.max(0.2, Math.min(3.0, Math.round(v * 100) / 100));
 
     // Hovering a keyframe dollies THAT keyframe; anywhere else dollies the
