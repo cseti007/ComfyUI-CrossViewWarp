@@ -300,8 +300,16 @@ def _warp_frame(rgb_ref, depth_ref, C_ref, C_tgt, fx_pix, splat, cx, cy):
     Ci = np.linalg.inv(C_tgt)
     Xd = (Ci[:3, :3] @ Xw.T).T + Ci[:3, 3]
     zt = Xd[:, 2]
-    ui = np.round(Xd[:, 0] / zt * fx_pix + cx).astype(int)
-    vi = np.round(Xd[:, 1] / zt * fy_pix + cy).astype(int)
+    # Metric geometry carries NaN where the model marked sky/invalid, so this
+    # division produces non-finite values that numpy refuses to cast quietly.
+    # They are dropped by `val` a line below either way, but casting them raises
+    # a RuntimeWarning per frame; parking them far outside the frame keeps the
+    # console clean without touching a single valid pixel.
+    with np.errstate(invalid="ignore", divide="ignore"):
+        uf = Xd[:, 0] / zt * fx_pix + cx
+        vf = Xd[:, 1] / zt * fy_pix + cy
+    ui = np.round(np.nan_to_num(uf, nan=-1e6, posinf=1e6, neginf=-1e6)).astype(int)
+    vi = np.round(np.nan_to_num(vf, nan=-1e6, posinf=1e6, neginf=-1e6)).astype(int)
     val = fin.ravel() & (zt > 0)
     order = np.argsort(-zt)
     sel = order[val[order]]
@@ -558,6 +566,13 @@ def _quat_to_mat_xyzw(q):
 _T3 = np.diag([1.0, -1.0, -1.0])
 
 
+def _fx(ci, height):
+    """Focal in pixels from a camera_info's VERTICAL fov and zoom (square pixels)."""
+    vfov = float(ci.get("fov") or 0.0) or 35.0
+    zoom = float(ci.get("zoom") or 1.0) or 1.0
+    return height / (2.0 * np.tan(np.radians(vfov) / 2.0)) * zoom
+
+
 def _camera_info_pose(ci, height):
     """Load3DCamera dict -> (C_tgt 4x4 in this node's frame, fx in pixels).
 
@@ -576,16 +591,32 @@ def _camera_info_pose(ci, height):
     else:                                   # only a look-at target: no roll info
         tgt3 = np.array([g(ci.get("target"), "x"), g(ci.get("target"), "y"),
                          g(ci.get("target"), "z")])
-        return _look_at(_T3 @ eye3, _T3 @ tgt3), None
+        return _look_at(_T3 @ eye3, _T3 @ tgt3), _fx(ci, height)
     C = np.eye(4)
     # columns are (right, up, backward) in three.js; this node wants
     # (right, down, forward), hence the second flip on the right
     C[:3, :3] = _T3 @ R3 @ np.diag([1.0, -1.0, -1.0])
     C[:3, 3] = _T3 @ eye3
-    vfov = float(ci.get("fov") or 0.0) or 35.0
-    zoom = float(ci.get("zoom") or 1.0) or 1.0
-    fx = height / (2.0 * np.tan(np.radians(vfov) / 2.0)) * zoom   # square pixels
-    return C, fx
+    return C, _fx(ci, height)
+
+
+def _pose_to_orbit_angles(C, pivot):
+    """Inverse of _orbit_C_tgt's placement: pose -> (az, el, dist) about `pivot`.
+
+    Only used to draw the orbit_view diagram for a pose that did not come from
+    an orbit (an explicit camera_info), so the picture shows where the camera
+    ended up instead of angles nobody asked for. Round-trips exactly against
+    _orbit_C_tgt for a pivot on the optical axis.
+    """
+    v = C[:3, 3] - pivot
+    r = float(np.linalg.norm(v))
+    p = float(np.linalg.norm(pivot))
+    if r < 1e-9 or p < 1e-9:
+        return 0.0, 0.0, 1.0
+    d = v / r
+    el = float(np.degrees(np.arcsin(np.clip(-d[1], -1.0, 1.0))))
+    az = float(np.degrees(np.arctan2(d[0], -d[2])))
+    return az, el, r / p
 
 
 def _orbit_C_tgt(az_deg, el_deg, dist, pivot, aim=None):
@@ -734,9 +765,10 @@ class CrossViewWarp:
                     "Leave unconnected if you are feeding moge_geometry instead."}),
                 "moge_geometry": ("MOGE_GEOMETRY", {
                     "tooltip": "Metric geometry from Run MoGe Inference, used INSTEAD of the "
-                    "depth image. Depth then arrives in real metres, so depth_ratio and "
-                    "invert_depth are ignored - there is no relief to guess and no polarity to "
-                    "flip - and pivot/distance become real distances. Measured against ground "
+                    "depth image. Depth then arrives in real metres, so depth_ratio, "
+                    "invert_depth and smooth_depth are ignored - there is no relief to guess, no "
+                    "polarity to flip and nothing to denoise - and pivot/distance become real "
+                    "distances. Measured against ground "
                     "truth this roughly halves the warp error versus a relative depth map, "
                     "because a relative map has no scale and the guessed one is usually wrong. "
                     "hfov is taken from its intrinsics when hfov is 0, but MoGe estimates the "
@@ -805,6 +837,11 @@ class CrossViewWarp:
         # relative map, so applying it here would throw the metres away
         z = metric_z if metric_z is not None else _depth_to_z(depth_bhw, invert_depth, depth_ratio)
 
+        if 0.0 < hfov < 20.0:
+            raise ValueError(
+                "CrossViewWarp: hfov=%.1f is not a usable field of view. Use 0 to read the "
+                "focal length from moge_geometry, or a real lens angle of 20 degrees or more."
+                % hfov)
         fx = W / (2.0 * np.tan(np.radians(hfov) / 2.0)) if hfov > 0 else None
         if fx is None:
             # hfov 0 = take it from MoGe's own intrinsics. Measured: MoGe runs
@@ -969,7 +1006,11 @@ class CrossViewWarp:
         warp = np.stack(warp_frames, 0)  # [B,H,W,3] uint8
 
         warp_t = torch.from_numpy(warp.astype(np.float32) / 255.0)
-        # keyframed runs document the whole path; a static run documents the pose
+        # keyframed runs document the whole path; a static run documents the pose.
+        # A camera_info pose never came from an orbit, so read its angles back out
+        # rather than drawing the az/el widgets it overrode.
+        if ci_C is not None:
+            mid_az, mid_el, mid_dist = _pose_to_orbit_angles(ci_C, pivot)
         orbit = _orbit_view_image(mid_az, mid_el, mid_dist,
                                   kfs=kfs if keyframing else None, smooth=smooth_path)
         orbit_t = torch.from_numpy(orbit.astype(np.float32) / 255.0)[None]  # [1,H,W,3]
