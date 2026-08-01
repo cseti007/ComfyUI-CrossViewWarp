@@ -588,14 +588,26 @@ def _camera_info_pose(ci, height):
     return C, fx
 
 
-def _orbit_C_tgt(az_deg, el_deg, dist, pivot):
-    """Camera pose orbiting `pivot` at the requested az/el/dist.
+def _orbit_C_tgt(az_deg, el_deg, dist, pivot, aim=None):
+    """Camera pose orbiting `pivot` at the requested az/el/dist, looking at `aim`.
 
     Mirrors the inline math that was in build(): angle signs are negated so
-    +azimuth = camera orbits RIGHT, +elevation = camera RISES (OpenCV frame)."""
+    +azimuth = camera orbits RIGHT, +elevation = camera RISES (OpenCV frame).
+
+    `aim` defaults to the pivot, which is what this node always did - and which
+    is measurably NOT what the training data does. The dataset builder orbits
+    the camera about the subject but keeps it pointed at whatever camera A was
+    pointed at, so the framing carries over instead of the subject snapping to
+    the middle. Only 25% of the dataset (the `standard` family) has those two
+    points coincide; across the rest camera B is off the pivot by a median 4 to
+    31 degrees. Measured against the training warp on 12 scenes: aiming at the
+    pivot scores 42.3, keeping the source aim scores 28.9, and the exact pose
+    ceiling is 26.8 - so the aim is worth ~14 points and the pivot itself only
+    ~3.
+    """
     R_orbit = _rot_y(np.radians(-az_deg)) @ _rot_x(np.radians(-el_deg))
     eye = pivot + dist * (R_orbit @ (-pivot))
-    return _look_at(eye, pivot)
+    return _look_at(eye, pivot if aim is None else aim)
 
 
 # --- ComfyUI node ------------------------------------------------------------
@@ -695,6 +707,22 @@ class CrossViewWarp:
                     "through them with no corner (still passes exactly through every keyframe). "
                     "With only two keyframes the two are identical. Only used when 'use_keyframes' "
                     "is ON."}),
+                # NEW WIDGET - appended, never inserted. ComfyUI stores widget
+                # values positionally, so putting this anywhere above would
+                # shift every later value in already-saved workflows.
+                "keep_source_aim": ("BOOLEAN", {"default": False,
+                    "tooltip": "Keep the SOURCE camera's aim while orbiting, instead of turning "
+                    "to face the pivot. This is what the training data does: the dataset moves "
+                    "camera B along an arc around the subject but leaves it pointed where camera "
+                    "A was pointed, so your framing carries over rather than the subject snapping "
+                    "to the centre. Measured against the training warps on 12 scenes: aiming at "
+                    "the pivot scores 42.3, keeping the source aim 28.9, and the best possible "
+                    "(exact known pose) 26.8 - so this recovers most of the gap. OFF by default "
+                    "only because it changes the output of every saved workflow; turn it ON for "
+                    "new work. Ignored when camera_info is connected, which carries its own aim. "
+                    "Also does nothing while the pivot sits on the optical axis (pivot_x and "
+                    "pivot_y both 0, the default) - there the source aim and the pivot are the "
+                    "same point; it bites with an off-axis or automatic pivot."}),
                 # Sockets, not widgets, so they take no widget_values slot and
                 # cannot shift the ones above in saved workflows. `depth` moved
                 # here from `required` so a metric-geometry graph does not have
@@ -737,7 +765,8 @@ class CrossViewWarp:
     def build(self, frames, azimuth, elevation, distance, hfov, head_bias, depth_ratio, smooth_depth, invert_depth,
               roll_lock=True, pivot_override=True, pivot_x=0.0, pivot_y=0.0, pivot_z=1.05,
               use_keyframes=False, frame_count=0, keyframes="", interp_motion="linear",
-              interpolation="linear", camera_info=None, moge_geometry=None, depth=None):
+              interpolation="linear", keep_source_aim=False,
+              camera_info=None, moge_geometry=None, depth=None):
         # frames: [B,H,W,C] float [0,1]; depth: [B,H,W,C] brightness [0,1]
         rgb = (frames.clamp(0, 1).cpu().numpy() * 255.0).astype(np.uint8)   # [B,H,W,3]
         B, H, W = rgb.shape[:3]
@@ -819,6 +848,19 @@ class CrossViewWarp:
         if pivot_override:
             pivot = np.array([pivot_x, pivot_y, pivot_z], dtype=np.float64)
 
+        # Where the orbiting camera LOOKS. The source camera sits at the origin
+        # looking down +Z in this frame, so its optical axis IS +Z and keeping
+        # its aim means targeting a point on that axis; the only choice left is
+        # how far along.
+        #
+        # The pivot's own distance, and NOT the metric depth at the frame
+        # centre. Taking the centre depth was the obvious refinement and it
+        # measured worse - 34.2 against 28.9 on the same twelve scenes - because
+        # the middle of the frame is usually the subject, which sits nearer than
+        # the point a real camera is actually aimed at.
+        aim = (np.array([0.0, 0.0, max(float(np.linalg.norm(pivot)), 1e-3)])
+               if keep_source_aim else None)
+
         C_ref = np.eye(4)
 
         # "Base" pose drives roll-lock estimation AND the orbit_view preview.
@@ -845,7 +887,7 @@ class CrossViewWarp:
             mid_az, mid_el, mid_dist = kfs[0][1], kfs[0][2], kfs[0][3]
         else:
             mid_az, mid_el, mid_dist = azimuth, elevation, distance
-        C_tgt = ci_C if ci_C is not None else _orbit_C_tgt(mid_az, mid_el, mid_dist, pivot)
+        C_tgt = ci_C if ci_C is not None else _orbit_C_tgt(mid_az, mid_el, mid_dist, pivot, aim)
 
         # roll lock: keep the subject's projected in-image lean identical to
         # the source by rolling the camera about its optical axis (a pitched
@@ -915,7 +957,7 @@ class CrossViewWarp:
             if keyframing:
                 # i is a 0-based buffer index; keyframes are numbered from 1
                 fr_az, fr_el, fr_dist = _sample_path(path, i + 1, interp_motion, smooth_path)
-                C_tgt_i = _orbit_C_tgt(fr_az, fr_el, fr_dist, pivot)
+                C_tgt_i = _orbit_C_tgt(fr_az, fr_el, fr_dist, pivot, aim)
                 if applied_droll != 0.0:
                     C_tgt_i = C_tgt_i.copy()
                     C_tgt_i[:3, :3] = _rodrigues(C_tgt_i[:3, 2], applied_droll) @ C_tgt_i[:3, :3]
