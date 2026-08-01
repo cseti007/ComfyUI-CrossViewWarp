@@ -669,9 +669,17 @@ class CrossViewWarp:
                     "0 = read the focal length from moge_geometry's intrinsics instead - a "
                     "fallback, not the better choice, since MoGe estimates the focal about 10% "
                     "short. With no moge_geometry connected, 0 falls back to 50."}),
-                "head_bias": ("FLOAT", {"default": 0.0, "min": -0.5, "max": 0.5, "step": 0.02,
-                    "tooltip": "Manual vertical framing shift (fraction of height; + = shift the "
-                    "view up). Leave at 0 unless the subject's head gets clipped."}),
+                # Renamed from head_bias, which named the use case rather than the
+                # effect. Kept in the SAME widget position: widget values are
+                # stored positionally, so a rename in place leaves saved
+                # workflows intact (a converted-to-input link, which is stored by
+                # name, is the one thing that does not survive).
+                "vertical_shift": ("FLOAT", {"default": 0.0, "min": -1.0, "max": 1.0, "step": 0.02,
+                    "tooltip": "Vertical LENS SHIFT: slides the rendered frame up or down, as a "
+                    "fraction of image height. Positive moves the picture DOWN, i.e. the framing "
+                    "up, which is what recovers a subject whose head is clipped. This is not a "
+                    "camera move - the camera does not travel, so nothing changes parallax; the "
+                    "image is translated rigidly. Leave at 0 unless the framing needs rescuing."}),
                 "depth_ratio": ("FLOAT", {"default": 6.0, "min": 1.5, "max": 1000.0, "step": 0.5,
                     "tooltip": "Max far/near depth ratio of the scene. Lower = flatter relief and "
                     "a cleaner warp; higher = more parallax but messier on cluttered scenes. "
@@ -794,7 +802,7 @@ class CrossViewWarp:
     FUNCTION = "build"
     CATEGORY = "CrossView"
 
-    def build(self, frames, azimuth, elevation, distance, hfov, head_bias, depth_ratio, smooth_depth, invert_depth,
+    def build(self, frames, azimuth, elevation, distance, hfov, vertical_shift, depth_ratio, smooth_depth, invert_depth,
               roll_lock=True, pivot_override=True, pivot_x=0.0, pivot_y=0.0, pivot_z=1.05,
               use_keyframes=False, frame_count=0, keyframes="", interp_motion="linear",
               interpolation="linear", keep_source_aim=False,
@@ -983,10 +991,11 @@ class CrossViewWarp:
                     break
 
         # principal point stays at the image centre (training warps use real
-        # camera intrinsics, no lens-shift); head_bias is a manual vertical
-        # shift only (default 0 = off)
+        # camera intrinsics, no lens shift); vertical_shift is a manual lens
+        # shift only (default 0 = off) - it translates the rendered frame and
+        # leaves the camera where it is, so it cannot change parallax
         cx_eff = cc
-        cy_eff = cch + head_bias * H
+        cy_eff = cch + vertical_shift * H
 
         pbar = ProgressBar(B) if ProgressBar is not None else None
         warp_frames = []
