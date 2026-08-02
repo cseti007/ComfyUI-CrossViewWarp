@@ -36,6 +36,10 @@ except Exception:  # allow standalone import (tests / non-ComfyUI use)
 
 MAGENTA = np.array([255, 0, 255], dtype=np.uint8)
 
+# Filled in by crossview_preview_node on import; called at the end of build().
+# A slot rather than an import keeps the dependency one-way.
+_PREVIEW_SINK = None
+
 
 def _dist_scale(d):
     """Map source-distance ratio (0.1..3.0) to a canvas radius multiplier.
@@ -247,8 +251,8 @@ def _orbit_view_image(azimuth, elevation, distance, size=512, kfs=None, smooth=F
         # Walked segment by segment with the shared unwrap + Catmull-Rom helpers,
         # which is what keeps it identical to the widget and to the render.
         if len(kfs) >= 2:
-            az_un = _unwrap_seq([kf[1] for kf in kfs])
-            els = [kf[2] for kf in kfs]
+            az_un = _unwrap_seq([kf["az"] for kf in kfs])
+            els = [kf["el"] for kf in kfs]
             SUB = 24
             prev = None
             for seg in range(len(kfs) - 1):
@@ -262,7 +266,8 @@ def _orbit_view_image(azimuth, elevation, distance, size=512, kfs=None, smooth=F
                                width=max(2, round(2.5 * k)))
                     prev = (x1, y1)
 
-        for f_no, kaz, kel, kdist, _kvs in kfs:
+        for kf in kfs:
+            f_no, kaz, kel, kdist = kf["f"], kf["az"], kf["el"], kf["dist"]
             kx, ky, kfront = pt(kaz, kel)
             distFk = _dist_scale(kdist)
             kpx, kpy = cx + (kx - cx) * distFk, cy + (ky - cy) * distFk
@@ -278,7 +283,7 @@ def _orbit_view_image(azimuth, elevation, distance, size=512, kfs=None, smooth=F
             d.text((kpx - (bb[2] - bb[0]) / 2, kpy - (bb[3] - bb[1]) / 2 - bb[1]), lab,
                    fill=(14, 20, 16, 255), font=f_dot)
 
-        label = (f"{len(kfs)} keyframes  f{kfs[0][0]}-{kfs[-1][0]}  "
+        label = (f"{len(kfs)} keyframes  f{kfs[0]['f']}-{kfs[-1]['f']}  "
                  f"{'smooth' if smooth else 'linear'}")
 
     d.text((8 * k, 6 * k), label, fill=(255, 255, 100, 255), font=f_txt)
@@ -447,12 +452,13 @@ def _seg_value(vals, seg, u, smooth):
     return _catmull(p0, p1, p2, p3, u)
 
 
-def _parse_keyframes(raw, frame_count, default_vs=0.0):
-    """Parse the `keyframes` widget into a sorted [(frame, az, el, dist, vs), ...].
+def _parse_keyframes(raw, frame_count, default_vs=0.0, default_pivot=(0.0, 0.0, 1.05)):
+    """Parse the `keyframes` widget into a sorted list of keyframe dicts.
 
-    "vs" (vertical lens shift) is OPTIONAL: a keyframe without one inherits
-    `default_vs`, the node's static widget. A path written before vs existed
-    therefore gives every keyframe the same value, which is what it used to do.
+    "vs" (vertical lens shift) and "px"/"py"/"pz" (the pivot) are OPTIONAL: a
+    keyframe without them inherits the node's static widgets. A path written
+    before those fields existed therefore gives every keyframe the same values,
+    which is exactly what it used to do.
 
     Frame numbers are 1-based, matching how the clip reads to a user (frame 1 is
     the first frame, frame `frame_count` the last); the loop in build() converts.
@@ -484,6 +490,9 @@ def _parse_keyframes(raw, frame_count, default_vs=0.0):
             f = int(round(float(kf["f"])))
             az, el, dist = float(kf["az"]), float(kf["el"]), float(kf["dist"])
             vs = float(kf.get("vs", default_vs))
+            px = float(kf.get("px", default_pivot[0]))
+            py = float(kf.get("py", default_pivot[1]))
+            pz = float(kf.get("pz", default_pivot[2]))
         except (KeyError, TypeError, ValueError):
             raise ValueError(
                 "CrossViewWarp: keyframe #%d needs numeric 'f', 'az', 'el' and 'dist'." % i
@@ -497,10 +506,11 @@ def _parse_keyframes(raw, frame_count, default_vs=0.0):
                 "CrossViewWarp: keyframe #%d sits at frame %d, but this clip only has %d frames. "
                 "The camera path was authored for a longer clip -- move that keyframe, or feed a "
                 "longer clip." % (i, f, frame_count))
-        out.append((f, az, el, dist, vs))
+        out.append({"f": f, "az": az, "el": el, "dist": dist, "vs": vs,
+                    "px": px, "py": py, "pz": pz})
 
-    out.sort(key=lambda k: k[0])
-    seen = [k[0] for k in out]
+    out.sort(key=lambda k: k["f"])
+    seen = [k["f"] for k in out]
     if len(set(seen)) != len(seen):
         raise ValueError("CrossViewWarp: two keyframes share the same frame number.")
     return out
@@ -509,17 +519,18 @@ def _parse_keyframes(raw, frame_count, default_vs=0.0):
 def _prepare_path(kfs):
     """Pre-split the keyframe list into the arrays the sampler reads (done once,
     not per frame). Azimuth is unwrapped here so every segment lookup stays cheap."""
-    return {
-        "f": [k[0] for k in kfs],
-        "az": _unwrap_seq([k[1] for k in kfs]),
-        "el": [k[2] for k in kfs],
-        "dist": [k[3] for k in kfs],
-        "vs": [k[4] for k in kfs],
-    }
+    out = {"f": [k["f"] for k in kfs], "az": _unwrap_seq([k["az"] for k in kfs])}
+    for key in ("el", "dist", "vs", "px", "py", "pz"):
+        out[key] = [k[key] for k in kfs]
+    return out
 
 
 def _sample_path(path, frame, easing, smooth):
-    """Camera pose (az, el, dist, vertical_shift) at a 1-based frame number.
+    """Camera pose at a 1-based frame number, as a dict.
+
+    Returns az / el / dist / vs / px / py / pz - a dict rather than a tuple
+    because the channel list has grown twice now, and positional unpacking at
+    four call sites is how one of them quietly ends up reading the wrong one.
 
     Outside the keyframed span the pose is HELD rather than extrapolated, so a
     path covering only part of the clip simply stops moving -- that is what makes
@@ -530,10 +541,11 @@ def _sample_path(path, frame, easing, smooth):
     move use interpolation='smooth' with easing 'linear', otherwise the eased
     stop at every knot cancels the smoothing the spline exists to provide."""
     fs = path["f"]
+    KEYS = ("az", "el", "dist", "vs", "px", "py", "pz")
     if frame <= fs[0]:
-        return path["az"][0], path["el"][0], path["dist"][0], path["vs"][0]
+        return {k: path[k][0] for k in KEYS}
     if frame >= fs[-1]:
-        return path["az"][-1], path["el"][-1], path["dist"][-1], path["vs"][-1]
+        return {k: path[k][-1] for k in KEYS}
 
     seg = 0
     for i in range(len(fs) - 1):
@@ -546,10 +558,17 @@ def _sample_path(path, frame, easing, smooth):
     # past +-90 elevation the camera tips over the pole, and a distance <= 0 puts
     # the eye on the far side of the pivot.
     az = _wrap_deg(_seg_value(path["az"], seg, u, smooth))
-    el = float(np.clip(_seg_value(path["el"], seg, u, smooth), -90.0, 90.0))
-    dist = float(np.clip(_seg_value(path["dist"], seg, u, smooth), 0.1, 3.0))
-    vs = float(np.clip(_seg_value(path["vs"], seg, u, smooth), -1.0, 1.0))
-    return az, el, dist, vs
+    out = {
+        "az": az,
+        "el": float(np.clip(_seg_value(path["el"], seg, u, smooth), -90.0, 90.0)),
+        "dist": float(np.clip(_seg_value(path["dist"], seg, u, smooth), 0.1, 3.0)),
+        "vs": float(np.clip(_seg_value(path["vs"], seg, u, smooth), -1.0, 1.0)),
+        "px": float(_seg_value(path["px"], seg, u, smooth)),
+        "py": float(_seg_value(path["py"], seg, u, smooth)),
+        # a pivot at or behind the camera has no orbit to define
+        "pz": float(max(_seg_value(path["pz"], seg, u, smooth), 0.01)),
+    }
+    return out
 
 
 def _quat_to_mat_xyzw(q):
@@ -686,7 +705,11 @@ class CrossViewWarp:
                     "fraction of image height. Positive moves the picture DOWN, i.e. the framing "
                     "up, which is what recovers a subject whose head is clipped. This is not a "
                     "camera move - the camera does not travel, so nothing changes parallax; the "
-                    "image is translated rigidly. Leave at 0 unless the framing needs rescuing."}),
+                    "image is translated rigidly (measured: every point moves by the same amount, "
+                    "to 0.000 px). pivot_y reframes too while the camera aims at the pivot, but "
+                    "it stops doing so under keep_source_aim and it changes the orbit radius on "
+                    "the way; this one works in both aim modes and never touches the 3D setup. "
+                    "Leave at 0 unless the framing needs rescuing."}),
                 "depth_ratio": ("FLOAT", {"default": 6.0, "min": 1.5, "max": 1000.0, "step": 0.5,
                     "tooltip": "Max far/near depth ratio of the scene. Lower = flatter relief and "
                     "a cleaner warp; higher = more parallax but messier on cluttered scenes. "
@@ -711,9 +734,19 @@ class CrossViewWarp:
                     "the recommended setup."}),
                 "pivot_x": ("FLOAT", {"default": 0.0, "min": -1000.0, "max": 1000.0, "step": 0.01,
                     "tooltip": "Pivot X in the source camera frame (+ = right), in depth units. "
-                    "0 = image centre."}),
+                    "0 = image centre. NOTE that by default the camera AIMS at the pivot, so "
+                    "moving this also reframes the shot - within about 3 pixels of what "
+                    "vertical_shift would do, on a 384px frame. That stops as soon as "
+                    "keep_source_aim is ON, where the aim stays on the optical axis and this "
+                    "moves the picture by exactly nothing. Moving the pivot also changes the "
+                    "orbit radius, which is dist * |pivot|, so it alters how much parallax a "
+                    "given azimuth produces."}),
                 "pivot_y": ("FLOAT", {"default": 0.0, "min": -1000.0, "max": 1000.0, "step": 0.01,
-                    "tooltip": "Pivot Y (+ = down), in depth units. 0 = image centre."}),
+                    "tooltip": "Pivot Y (+ = down), in depth units. 0 = image centre. Same "
+                    "caveats as pivot_x: it doubles as a vertical reframe while the camera aims "
+                    "at the pivot, does nothing to the framing once keep_source_aim is ON, and "
+                    "changes the orbit radius either way. Use vertical_shift when you want to "
+                    "reframe WITHOUT touching the 3D setup."}),
                 "pivot_z": ("FLOAT", {"default": 1.05, "min": 0.01, "max": 1000.0, "step": 0.01,
                     "tooltip": "Pivot depth (how far in front of the camera). ~1.05 sits on the "
                     "nearest subject in the middle of the frame; raise it to orbit around "
@@ -728,19 +761,28 @@ class CrossViewWarp:
                     "one pose. When OFF, the single azimuth/elevation/distance above is applied to "
                     "every frame. Right-click the orbit sphere to place keyframes."}),
                 "frame_count": ("INT", {"default": 0, "min": 0, "max": 100000, "step": 1,
-                    "tooltip": "How many frames the clip has, so the sphere knows where the path "
-                    "ends: new keyframes are then spread evenly from frame 1 to the last frame "
-                    "instead of the blind 24-frame default. Hand-edit any frame number in "
-                    "'keyframes' and the even spread stops being re-applied, leaving your timing "
-                    "alone. 0 = off. This is a UI aid - the node always validates keyframes against "
-                    "the clip it actually receives, and logs a warning if that count differs."}),
+                    "tooltip": "RETIRED - hidden in the UI and safe to ignore. It used to tell the "
+                    "orbit sphere how long the clip was, because nothing else knew; a run now "
+                    "caches the clip for the live preview and the real length comes with it. The "
+                    "widget is kept, and still honoured if a saved workflow carries a value, only "
+                    "because widget values are stored positionally and removing one would shift "
+                    "every value after it. The node always validates keyframes against the clip it "
+                    "actually receives."}),
                 "keyframes": ("STRING", {"default": "", "multiline": False,
-                    "tooltip": "Camera path as JSON, written by right-clicking the orbit sphere - "
-                    "you normally never type in here. Each entry is one keyframe: 'f' = frame number, "
-                    "'az'/'el' = angles in degrees, 'dist' = distance (1.0 = source). Example: "
-                    '[{"f":1,"az":-30,"el":20,"dist":1.0},{"f":49,"az":45,"el":10,"dist":1.2}] . '
-                    "Before the first and after the last keyframe the pose is held, so a path may "
-                    "cover only part of the clip. Empty = no move."}),
+                    "tooltip": "Camera path as JSON, written by right-clicking the orbit sphere "
+                    "or by parking the live preview's playhead and pressing KEY - you normally "
+                    "never type in here. Each entry is one keyframe: 'f' = frame number, "
+                    "'az'/'el' = angles in degrees, 'dist' = distance (1.0 = source). A keyframe "
+                    "may also carry 'vs' (vertical lens shift) and 'px'/'py'/'pz' (the pivot); "
+                    "those are OPTIONAL and anything left out inherits the static widget, so a "
+                    "path written before they existed behaves exactly as it did. Example: "
+                    '[{"f":1,"az":-30,"el":20,"dist":1.0,"vs":0,"px":0,"py":0,"pz":1.05},'
+                    '{"f":49,"az":45,"el":10,"dist":1.2}] . Animating the pivot swings the camera '
+                    "around one thing and then another, but the orbit radius is dist * |pivot|, so "
+                    "it moves the parallax with it; px/py/pz are ignored unless pivot_override is "
+                    "ON, since otherwise the node estimates the pivot and there is nothing to "
+                    "animate. Before the first and after the last keyframe the pose is held, so a "
+                    "path may cover only part of the clip. Empty = no move."}),
                 "interp_motion": (["linear", "ease_in_out", "ease_in", "ease_out"], {"default": "linear",
                     "tooltip": "Timing between consecutive keyframes. linear = constant speed; "
                     "ease_in_out = slow start & end (applied per segment, so the camera settles "
@@ -765,7 +807,10 @@ class CrossViewWarp:
                     "the pivot scores 42.3, keeping the source aim 28.9, and the best possible "
                     "(exact known pose) 26.8 - so this recovers most of the gap. OFF by default "
                     "only because it changes the output of every saved workflow; turn it ON for "
-                    "new work. Ignored when camera_info is connected, which carries its own aim. "
+                    "new work. Turning it ON also stops pivot_x/pivot_y from reframing the shot: "
+                    "the aim moves onto the optical axis, so they go back to being purely the "
+                    "orbit centre and vertical_shift becomes the way to shift the framing. "
+                    "Ignored when camera_info is connected, which carries its own aim. "
                     "Also does nothing while the pivot sits on the optical axis (pivot_x and "
                     "pivot_y both 0, the default) - there the source aim and the pivot are the "
                     "same point; it bites with an off-axis or automatic pivot."}),
@@ -795,7 +840,23 @@ class CrossViewWarp:
                     "IGNORED - the camera is placed where the camera_info says, instead of being "
                     "derived from an orbit around an estimated pivot. hfov is ignored too: the "
                     "focal length comes from the camera_info's own (vertical) fov and zoom."}),
+                # APPENDED, never inserted: widget values are positional. The
+                # sockets above take no slot, so these land after keep_source_aim.
+                "preview_size": ("INT", {"default": 512, "min": 128, "max": 768, "step": 32,
+                    "tooltip": "Longest side, in pixels, of the clip kept for the live preview "
+                    "widget. The warp is scale-invariant, so a small preview shows the same "
+                    "geometry as the full-size run - this trades sharpness and memory for frame "
+                    "rate and memory: about 1 MB per cached frame at 384, 1.8 MB at 512, and a "
+                    "render costs roughly 47 ms at 384 against 100 ms at 512, which is what "
+                    "sets the playback rate. Changing it takes effect on the next run, "
+                    "since it is what the clip gets cached at."}),
+                "frame_index": ("INT", {"default": 1, "min": 1, "max": 100000, "step": 1,
+                    "tooltip": "Playhead for the live preview, counted from 1. Scrub the bar "
+                    "under the preview or press play; this widget follows along and can be typed "
+                    "into. It does not affect the rendered output, and changing it needs no "
+                    "re-run."}),
             },
+            "hidden": {"unique_id": "UNIQUE_ID"},
         }
 
     RETURN_TYPES = ("IMAGE", "IMAGE")
@@ -813,7 +874,8 @@ class CrossViewWarp:
               roll_lock=True, pivot_override=True, pivot_x=0.0, pivot_y=0.0, pivot_z=1.05,
               use_keyframes=False, frame_count=0, keyframes="", interp_motion="linear",
               interpolation="linear", keep_source_aim=False,
-              camera_info=None, moge_geometry=None, depth=None):
+              camera_info=None, moge_geometry=None, depth=None,
+              preview_size=384, frame_index=1, unique_id=None):
         # frames: [B,H,W,C] float [0,1]; depth: [B,H,W,C] brightness [0,1]
         rgb = (frames.clamp(0, 1).cpu().numpy() * 255.0).astype(np.uint8)   # [B,H,W,3]
         B, H, W = rgb.shape[:3]
@@ -910,8 +972,19 @@ class CrossViewWarp:
         # measured worse - 34.2 against 28.9 on the same twelve scenes - because
         # the middle of the frame is usually the subject, which sits nearer than
         # the point a real camera is actually aimed at.
-        aim = (np.array([0.0, 0.0, max(float(np.linalg.norm(pivot)), 1e-3)])
-               if keep_source_aim else None)
+        def _aim_of(p):
+            return (np.array([0.0, 0.0, max(float(np.linalg.norm(p)), 1e-3)])
+                    if keep_source_aim else None)
+
+        def _pivot_of(sample):
+            """The pivot a sampled pose asks for.
+
+            Per-keyframe pivots only mean anything while the pivot is being
+            GIVEN: with pivot_override off the node estimates one from frame 0,
+            and there is nothing for a path to animate."""
+            if not pivot_override:
+                return pivot
+            return np.array([sample["px"], sample["py"], sample["pz"]], dtype=np.float64)
 
         C_ref = np.eye(4)
 
@@ -927,20 +1000,25 @@ class CrossViewWarp:
                 "CrossViewWarp: frame_count is %d but this clip has %d frames - the camera path "
                 "was spaced for a different length. Update frame_count to re-space new keyframes.",
                 frame_count, B)
-        kfs = _parse_keyframes(keyframes, B, vertical_shift) if use_keyframes else []
+        # A keyframe with no px/py/pz inherits this, so older paths are unchanged.
+        kfs = (_parse_keyframes(keyframes, B, vertical_shift, tuple(float(c) for c in pivot))
+               if use_keyframes else [])
         path = _prepare_path(kfs) if kfs else None
         keyframing = bool(len(kfs) >= 2 and B > 1) and ci_C is None
         smooth_path = (interpolation == "smooth")
         if keyframing:
             # middle frame, 1-based: frames run 1..B
-            mid_az, mid_el, mid_dist, mid_vs = _sample_path(
-                path, (B + 1) // 2, interp_motion, smooth_path)
+            mid = _sample_path(path, (B + 1) // 2, interp_motion, smooth_path)
         elif kfs:
             # a single keyframe is not a move -- treat it as the static pose
-            mid_az, mid_el, mid_dist, mid_vs = kfs[0][1], kfs[0][2], kfs[0][3], kfs[0][4]
+            mid = kfs[0]
         else:
-            mid_az, mid_el, mid_dist, mid_vs = azimuth, elevation, distance, vertical_shift
-        C_tgt = ci_C if ci_C is not None else _orbit_C_tgt(mid_az, mid_el, mid_dist, pivot, aim)
+            mid = {"az": azimuth, "el": elevation, "dist": distance, "vs": vertical_shift,
+                   "px": float(pivot[0]), "py": float(pivot[1]), "pz": float(pivot[2])}
+        mid_az, mid_el, mid_dist, mid_vs = mid["az"], mid["el"], mid["dist"], mid["vs"]
+        mid_pivot = _pivot_of(mid)
+        C_tgt = (ci_C if ci_C is not None
+                 else _orbit_C_tgt(mid_az, mid_el, mid_dist, mid_pivot, _aim_of(mid_pivot)))
 
         # roll lock: keep the subject's projected in-image lean identical to
         # the source by rolling the camera about its optical axis (a pitched
@@ -1012,9 +1090,14 @@ class CrossViewWarp:
         for i in range(B):
             if keyframing:
                 # i is a 0-based buffer index; keyframes are numbered from 1
-                fr_az, fr_el, fr_dist, fr_vs = _sample_path(
-                    path, i + 1, interp_motion, smooth_path)
-                C_tgt_i = _orbit_C_tgt(fr_az, fr_el, fr_dist, pivot, aim)
+                fr = _sample_path(path, i + 1, interp_motion, smooth_path)
+                fr_vs = fr["vs"]
+                # The pivot is part of the pose, so a move can swing around one
+                # thing then another. Radius is dist * |pivot|, so this animates
+                # the parallax too.
+                fr_pivot = _pivot_of(fr)
+                C_tgt_i = _orbit_C_tgt(fr["az"], fr["el"], fr["dist"], fr_pivot,
+                                       _aim_of(fr_pivot))
                 if applied_droll != 0.0:
                     C_tgt_i = C_tgt_i.copy()
                     C_tgt_i[:3, :3] = _rodrigues(C_tgt_i[:3, 2], applied_droll) @ C_tgt_i[:3, :3]
@@ -1034,11 +1117,26 @@ class CrossViewWarp:
         # A camera_info pose never came from an orbit, so read its angles back out
         # rather than drawing the az/el widgets it overrode.
         if ci_C is not None:
-            mid_az, mid_el, mid_dist = _pose_to_orbit_angles(ci_C, pivot)
+            mid_az, mid_el, mid_dist = _pose_to_orbit_angles(ci_C, mid_pivot)
         orbit = _orbit_view_image(mid_az, mid_el, mid_dist,
                                   kfs=kfs if keyframing else None, smooth=smooth_path)
         orbit_t = torch.from_numpy(orbit.astype(np.float32) / 255.0)[None]  # [1,H,W,3]
-        return (warp_t, orbit_t)
+        # The live preview keeps a downscaled copy so the browser can re-warp
+        # without another run. Left None, the node behaves exactly as before.
+        info = None
+        if _PREVIEW_SINK is not None and unique_id is not None:
+            try:
+                info = _PREVIEW_SINK(unique_id, frames, depth, moge_geometry, camera_info,
+                                     int(preview_size))
+            except Exception:
+                # a preview that cannot be cached must never fail the render
+                logging.exception("CrossViewWarp: could not cache the live preview")
+
+        if info is None:
+            return (warp_t, orbit_t)
+        # A `ui` payload is what makes ComfyUI emit an "executed" message, which
+        # is the widget's only signal that the cache is fresh.
+        return {"ui": {"crossview_preview": [info]}, "result": (warp_t, orbit_t)}
 
 
 _ID = f"CrossViewWarp{NODE_SUFFIX}"

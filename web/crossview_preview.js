@@ -1,21 +1,13 @@
-// CrossView Live Preview — draggable, playable warp preview for the
-// CrossViewPreview node.
+// CrossView Live Preview — draggable, playable warp preview for the warp node.
 //
-// The node caches the whole clip when the graph runs; this widget then POSTs a
-// camera pose plus a frame number at it and paints the returned warp. Dragging
-// happens ON THE IMAGE (left/right = azimuth, up/down = elevation, wheel =
-// distance) rather than on a separate globe: the thing you are aiming is the
-// picture, so that is what you grab. A scrub bar underneath moves the playhead.
+// The node caches the clip when the graph runs; this widget POSTs a pose and a
+// frame number at it and paints the returned warp. Dragging happens on the
+// image, not on a separate globe: the thing you are aiming is the picture.
 //
-// Playback is self-clocked: each frame is rendered on demand and the next is
-// requested only once the previous one has arrived, so the clip plays at
-// whatever rate the server can warp (about 20 fps at 384 px). It therefore does
-// not run at the clip's real frame rate — it is for judging the warp, not the
-// timing.
-//
-// Exactly one request is ever in flight. Intermediate drag positions are
-// dropped rather than queued: a queue would turn a fast drag into a growing
-// backlog of renders nobody wants to see any more, which reads as lag.
+// Playback is self-clocked - the next frame is requested only once the previous
+// arrives - so it runs at whatever rate the server can warp, not at the clip's
+// frame rate. Exactly one request is ever in flight; intermediate drag
+// positions are dropped rather than queued, which would just build a backlog.
 
 import { app } from "../../scripts/app.js";
 
@@ -24,15 +16,16 @@ const H_MAX = 560;
 const CTRL_H = 34;               // control strip: play button, scrub bar, readout
 const DRAG_SENS = 0.35;          // degrees per pixel
 const BTN_W = 24;
-const MODE_W = 46;               // "warp" / "source" toggle at the right of the strip
+const MODE_W = 104;              // view switch, top-right corner of the canvas
 const KEY_W = 26;                // keyframe drop/remove button
 const RST_W = 28;                // reset-to-defaults button
+const ISO_W = 24;                // pivot depth-plane overlay toggle
+const ISO_COL = "120,220,205";
+const KF_R = 4.5;                // keyframe marker radius on the scrub bar
 const DIM = "rgba(200,204,216,0.45)";
 
-// Parameters forwarded to the render endpoint. Kept in sync with _PARAMS in
-// crossview_preview_node.py; anything missing here falls back server-side.
-// frame_index is deliberately absent — it is the playhead, sent separately,
-// and it is not an argument to the warp.
+// Build kwargs, kept in sync with _PARAMS in crossview_preview_node.py.
+// frame_index is absent on purpose: it is the playhead, sent separately.
 const PARAM_NAMES = [
   "azimuth", "elevation", "distance", "hfov", "vertical_shift", "depth_ratio",
   "smooth_depth", "invert_depth", "roll_lock", "pivot_override",
@@ -45,6 +38,41 @@ const PARAM_NAMES = [
 
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 
+// Two canvases take turns being visible rather than sharing one surface: both
+// are full interactive controllers, and swapping visibility beats routing every
+// pointer event to whichever owns the current mode.
+const VIEWS = ["orbit", "warp"];
+
+function applyView(node) {
+  const v = node._crossviewView || "orbit";
+  for (const [name, want] of [["orbit", v === "orbit"], ["preview", v !== "orbit"]]) {
+    const w = node.widgets?.find((x) => x.name === name);
+    if (!w) continue;
+    // The canvas renderer reads widget.hidden, the Vue one reads
+    // widget.options.hidden and does not fall back to it. The element needs
+    // hiding directly too - a DOM widget stays in the page regardless.
+    w.hidden = !want;
+    if (w.options) w.options.hidden = !want;
+    const el = w.element || w.inputEl;
+    if (el && el.style) el.style.display = want ? "" : "none";
+  }
+  // computeSize() alone returns the MINIMUM, which threw away a node the user
+  // had resized. The width is what actually drives the canvas size, so keep it
+  // and let only the height follow the widget that is now showing.
+  if (node.setSize && node.computeSize) {
+    const w = node.size?.[0];
+    const min = node.computeSize();
+    node.setSize([Math.max(w ?? min[0], min[0]), min[1]]);
+  }
+  app.graph?.setDirtyCanvas(true, true);
+}
+
+function setView(node, v) {
+  node._crossviewView = VIEWS.includes(v) ? v : "orbit";
+  applyView(node);
+  node._crossviewPreview?.onViewChanged();
+}
+
 class PreviewEditor {
   constructor(node, canvas, endpoint, defaults) {
     this.node = node;
@@ -55,6 +83,11 @@ class PreviewEditor {
     // the Python defaults the way a hand-kept copy would.
     this.defaults = defaults || {};
     this.armed = false;          // reset asked for once, waiting for confirmation
+    // Tints the surfaces in the pivot's depth plane: WHAT you orbit, which the
+    // crosshair cannot show since the camera looks at the pivot by construction
+    // and it therefore sits dead centre in almost every configuration.
+    this.iso = false;
+    this._lastKfCount = 0;       // to detect crossing the "is there a path" line
     this.img = null;
     this.status = "run the graph once to load the clip";
     this.ms = null;
@@ -65,8 +98,7 @@ class PreviewEditor {
     // The path is suspended for the render so you can see what you are
     // aiming at, and KEY commits it. Nothing is written until you do.
     this.auditioning = false;
-    this.mode = "warp";          // "warp" = the render, "source" = the input frame
-    this.pivot = null;           // {u,v,src_u,src_v,z,scene_z,radius,auto} per render
+    this.pivot = null;           // {u,v,z,scene_z,radius,auto} per render
     this.rect = null;            // where the image was last drawn, for the marker
     this.inflight = false;
     this.shownSig = null;
@@ -82,16 +114,46 @@ class PreviewEditor {
     canvas.addEventListener("contextmenu", (e) => e.preventDefault());
 
     this.hookWidgets();
+    this.syncLabels();
     this.draw();
-    // The server cache outlives the browser, so after a page reload the clip is
-    // usually still there and the preview can paint without another run.
-    // Deferred by a tick because a node restored from a saved workflow does not
-    // have its final id yet while onNodeCreated is running.
-    setTimeout(() => this.request(), 0);
+    // The server cache outlives the browser, so a reload can paint without a
+    // re-run. Deferred a tick: a restored node has no final id yet in
+    // onNodeCreated, and the saved widget values are not applied either.
+    setTimeout(() => {
+      // after configure() has applied the saved widget values: seeding this from
+      // an empty widget would read a loaded path as "just appeared" and switch
+      // use_keyframes back on over the user's saved OFF
+      this._lastKfCount = this.kfs().length;
+      this.request();
+    }, 0);
+  }
+
+  get visible() {
+    return (this.node._crossviewView || "orbit") !== "orbit";
+  }
+
+  onViewChanged() {
+    this.node._crossviewSyncHidden?.();
+    this.playing = false;
+    this.shownSig = null;          // the mode is part of the signature
+    this.draw();
+    if (this.visible) this.request();
   }
 
   w(name) {
     return this.node.widgets?.find((x) => x.name === name);
+  }
+
+  // hfov 0 means "focal from moge_geometry", which reads as a nonsense lens
+  // angle. The value cell is ComfyUI's to draw, but the label is ours.
+  syncLabels() {
+    const wd = this.w("hfov");
+    if (!wd) return;
+    const want = Number(wd.value) === 0 ? "hfov (auto)" : "hfov";
+    if (wd.label !== want) {
+      wd.label = want;
+      app.graph?.setDirtyCanvas(true, false);
+    }
   }
 
   frames() {
@@ -105,7 +167,8 @@ class PreviewEditor {
   // Re-render when any parameter changes, including from the number widgets
   // themselves — otherwise typing a value would leave the picture behind.
   hookWidgets() {
-    const POSE = ["azimuth", "elevation", "distance", "vertical_shift"];
+    const POSE = ["azimuth", "elevation", "distance", "vertical_shift",
+                  "pivot_x", "pivot_y", "pivot_z"];
     for (const name of [...PARAM_NAMES, "frame_index"]) {
       const wd = this.w(name);
       if (!wd) continue;
@@ -113,6 +176,8 @@ class PreviewEditor {
       wd.callback = (...args) => {
         const r = prev?.apply(wd, args);
         if (POSE.includes(name)) this.syncKey();
+        this.syncLabels();
+        this.node._crossviewSyncHidden?.();
         this.request();
         return r;
       };
@@ -132,7 +197,7 @@ class PreviewEditor {
   }
 
   sig() {
-    return `${this.mode}|${this.frame()}|${JSON.stringify(this.params())}`;
+    return `${this.iso ? 1 : 0}|${this.frame()}|${JSON.stringify(this.params())}`;
   }
 
   request() {
@@ -140,7 +205,9 @@ class PreviewEditor {
   }
 
   async pump() {
-    if (this.inflight) return;
+    // Nothing to show while the sphere has the floor; the render would be
+    // thrown away and the request wasted.
+    if (this.inflight || !this.visible) return;
     const sig = this.sig();
     if (sig === this.shownSig) return;
     this.inflight = true;
@@ -153,7 +220,7 @@ class PreviewEditor {
         body: JSON.stringify({
           node_id: String(this.node.id),
           frame: this.frame(),
-          mode: this.mode,
+          iso: this.iso,
           params: this.params(),
         }),
       });
@@ -201,6 +268,9 @@ class PreviewEditor {
   setCount(n) {
     if (!this.info) this.info = {};
     this.info.of = n;
+    // Published for the orbit sphere: with the real clip length known, it stops
+    // refitting the path to the frame_count hint.
+    this.node._crossviewClipFrames = n;
     const wd = this.w("frame_index");
     if (wd) {
       if (wd.options) wd.options.max = n;
@@ -245,7 +315,8 @@ class PreviewEditor {
 
   barGeom() {
     const W = this.canvas.width, H = this.canvas.height;
-    return { x0: BTN_W + KEY_W + 14, x1: W - MODE_W - 14, y: H - CTRL_H + 12, top: H - CTRL_H };
+    return { x0: BTN_W + KEY_W + ISO_W + 18, x1: W - RST_W - 18,
+             y: H - CTRL_H + 12, top: H - CTRL_H };
   }
 
   keyGeom() {
@@ -253,10 +324,15 @@ class PreviewEditor {
     return { x0: BTN_W + 6, x1: BTN_W + 6 + KEY_W, y0: H - CTRL_H + 3, y1: H - CTRL_H + 21 };
   }
 
+  isoGeom() {
+    const H = this.canvas.height;
+    return { x0: BTN_W + KEY_W + 10, x1: BTN_W + KEY_W + 10 + ISO_W,
+             y0: H - CTRL_H + 3, y1: H - CTRL_H + 21 };
+  }
+
   rstGeom() {
     const W = this.canvas.width, H = this.canvas.height;
-    return { x0: W - MODE_W - RST_W - 12, x1: W - MODE_W - 12,
-             y0: H - CTRL_H + 3, y1: H - CTRL_H + 21 };
+    return { x0: W - RST_W - 12, x1: W - 12, y0: H - CTRL_H + 3, y1: H - CTRL_H + 21 };
   }
 
   // Back to the node's own defaults. A camera path is real work, so when one
@@ -274,16 +350,17 @@ class PreviewEditor {
     }
     this.playing = false;
     this.auditioning = false;
-    this.mode = "warp";
+    this.iso = false;
+    this._lastKfCount = 0;       // the path is gone; the next write is a fresh crossing
     this.shownSig = null;
+    setView(this.node, "warp");
     app.graph?.setDirtyCanvas(true, false);
     this.request();
   }
 
   // --- keyframes -----------------------------------------------------------
-  // The playhead IS the frame number, so a keyframe needs no spreading after
-  // the fact — which is the whole reason this is nicer than dropping them on
-  // the orbit sphere, where the widget has to guess the timing.
+  // The playhead IS the frame number, so nothing needs spreading afterwards the
+  // way it does on the sphere, which has to guess the timing.
   kfs() {
     const raw = this.w("keyframes")?.value;
     if (!raw) return [];
@@ -303,10 +380,15 @@ class PreviewEditor {
     const wd = this.w("keyframes");
     if (!wd) return;
     wd.value = JSON.stringify(list);
-    // A single keyframe is not a move; the node treats it as a static pose, so
-    // the switch follows the path rather than leaving a dead flag set.
-    const uk = this.w("use_keyframes");
-    if (uk) uk.value = list.length >= 2;
+    // Flip use_keyframes only when the path appears or disappears, so someone
+    // who switched the move off to compare is not overridden by nudging a
+    // marker. One keyframe counts: build() honours it as the static pose.
+    const has = list.length >= 1;
+    if (has !== (this._lastKfCount >= 1)) {
+      const uk = this.w("use_keyframes");
+      if (uk) uk.value = has;
+    }
+    this._lastKfCount = list.length;
     wd.callback?.(wd.value);
     app.graph?.setDirtyCanvas(true, false);
   }
@@ -316,19 +398,26 @@ class PreviewEditor {
       az: this.w("azimuth")?.value ?? 0,
       el: this.w("elevation")?.value ?? 0,
       dist: this.w("distance")?.value ?? 1,
-      // the lens shift is part of the framing, so it belongs to the keyframe
+      // the lens shift is part of the framing, and the pivot is what the camera
+      // orbits AND looks at, so both belong to the keyframe rather than being
+      // pinned globally for the whole clip
       vs: this.w("vertical_shift")?.value ?? 0,
+      px: this.w("pivot_x")?.value ?? 0,
+      py: this.w("pivot_y")?.value ?? 0,
+      pz: this.w("pivot_z")?.value ?? 1.05,
     };
   }
 
+  // One keyframe counts, matching build() and the use_keyframes threshold. When
+  // these disagreed, a drag at exactly one keyframe wrote into widgets the node
+  // had stopped reading: the camera did not move and KEY stored an unseen pose.
   keying() {
-    return !!this.w("use_keyframes")?.value && this.kfs().length >= 2;
+    return !!this.w("use_keyframes")?.value && this.kfs().length >= 1;
   }
 
-  // Called before a drag or a wheel step. On a keyframe, the drag edits it. Off
-  // one, the path is what drives the camera, so the widgets are stale — they get
-  // seeded from the pose actually on screen first, or the first drag would snap
-  // the camera to wherever the widgets were left.
+  // On a keyframe the drag edits it. Off one the path drives the camera and the
+  // widgets are stale, so they are seeded from the pose on screen first -
+  // otherwise the first drag snaps to wherever they were left.
   beginAudition() {
     if (this.auditioning || !this.keying() || this.keyIndex() >= 0) return;
     const ps = this.pivot?.pose;
@@ -339,6 +428,7 @@ class PreviewEditor {
       };
       set("azimuth", ps.az, 1); set("elevation", ps.el, 1);
       set("distance", ps.dist, 2); set("vertical_shift", ps.vs, 2);
+      set("pivot_x", ps.px, 2); set("pivot_y", ps.py, 2); set("pivot_z", ps.pz, 2);
     }
     this.auditioning = true;
   }
@@ -365,8 +455,36 @@ class PreviewEditor {
   }
 
   modeGeom() {
-    const W = this.canvas.width, H = this.canvas.height;
-    return { x0: W - MODE_W - 6, x1: W - 6, y0: H - CTRL_H + 3, y1: H - CTRL_H + 21 };
+    const W = this.canvas.width;
+    // Top-right, out of the control strip: it is a once-in-a-while action and
+    // was crowding the scrub bar, which is used constantly.
+    return { x0: W - MODE_W - 6, x1: W - 6, y0: 6, y1: 26 };
+  }
+
+  // Screen x of a keyframe on the scrub bar, or null if the clip length is not
+  // known yet (nothing to lay it out against).
+  kfX(kf) {
+    const n = this.frames();
+    if (n < 2) return null;
+    const g = this.barGeom();
+    const t = clamp((Math.round(+kf.f) - 1) / (n - 1), 0, 1);
+    return g.x0 + (g.x1 - g.x0) * t;
+  }
+
+  // Index of the keyframe marker under a point, or -1. Generous vertically:
+  // the strip is short and the markers are small.
+  pickKf(px, py) {
+    const g = this.barGeom();
+    if (Math.abs(py - g.y) > 10) return -1;
+    const list = this.kfs();
+    let best = -1, bestD = KF_R + 4;
+    list.forEach((kf, i) => {
+      const x = this.kfX(kf);
+      if (x == null) return;
+      const d = Math.abs(px - x);
+      if (d < bestD) { bestD = d; best = i; }
+    });
+    return best;
   }
 
   scrubTo(x) {
@@ -376,23 +494,44 @@ class PreviewEditor {
   }
 
   onDown(e) {
-    if (e.button !== 0) return;
     const p = this.pos(e);
+    if (e.button === 2) {
+      // Deletes THIS keyframe without scrubbing onto it, the one thing KEY
+      // cannot do. Markers only: an empty spot has no pose to give, and
+      // inventing one means reimplementing the path sampler here.
+      const i = this.pickKf(p.x, p.y);
+      if (i >= 0) {
+        const list = this.kfs();
+        list.splice(i, 1);
+        this.auditioning = false;
+        this.writeKfs(list);
+      }
+      e.preventDefault();
+      return;
+    }
+    if (e.button !== 0) return;
     const g = this.barGeom();
     const m = this.modeGeom();
     const k = this.keyGeom();
     const r = this.rstGeom();
     const hitRst = p.y >= g.top && p.x >= r.x0 && p.x <= r.x1;
     if (!hitRst && this.armed) { this.armed = false; this.draw(); }   // anything else disarms
+    if (p.x >= m.x0 && p.x <= m.x1 && p.y >= m.y0 && p.y <= m.y1) {
+      setView(this.node, "orbit");
+      // deliberately no pointer capture: nothing follows this click, and onUp
+      // returns early without a drag, so the capture would never be released
+      e.preventDefault();
+      return;
+    }
     if (p.y >= g.top) {
       if (hitRst) {
         this.reset();
       } else if (p.x >= k.x0 && p.x <= k.x1) {
         this.toggleKey();
-      } else if (p.x >= m.x0) {
-        this.mode = this.mode === "warp" ? "source" : "warp";
-        this.playing = false;
+      } else if (p.x >= this.isoGeom().x0 && p.x <= this.isoGeom().x1) {
+        this.iso = !this.iso;
         this.request();
+        this.draw();
       } else if (p.x <= BTN_W + 4) {
         this.playing = !this.playing;
         this.draw();
@@ -437,10 +576,9 @@ class PreviewEditor {
   }
 
   onWheel(e) {
-    // Over the control strip the wheel steps the playhead, over the image it
-    // dollies — the surface under the cursor says which one you meant. Wheel
-    // back (deltaY > 0) raises the number in both cases, matching the orbit
-    // widget and the graph's own numeric widgets.
+    // The surface under the cursor picks the meaning: strip steps the playhead,
+    // image dollies. Wheel back raises the number in both, like every other
+    // numeric widget in the graph.
     if (this.pos(e).y >= this.barGeom().top) {
       this.playing = false;
       this.step(Math.sign(e.deltaY), false);
@@ -456,16 +594,12 @@ class PreviewEditor {
     e.stopPropagation();
   }
 
-  // The pivot marker, plus the numbers that actually carry the information.
-  // Its screen position is the boring half — the camera looks AT the pivot, so
-  // in the warped view it sits dead centre unless keep_source_aim is on with an
-  // off-axis pivot. The depth comparison is the part worth reading.
+  // The camera looks AT the pivot, so this sits dead centre unless
+  // keep_source_aim is on with an off-axis pivot.
   drawPivot(ctx) {
     const p = this.pivot;
     if (!p || !this.rect || !this.img) return;
-    const src = this.mode === "source";
-    const u = src ? p.src_u : p.u;
-    const v = src ? p.src_v : p.v;
+    const { u, v } = p;
     const col = p.auto ? "230,200,90" : "120,190,255";
 
     if (Number.isFinite(u) && Number.isFinite(v)) {
@@ -490,27 +624,19 @@ class PreviewEditor {
       }
     }
 
-    const bits = [`pivot z ${p.z.toFixed(2)}`];
-    if (Number.isFinite(p.scene_z)) {
-      const d = p.z - p.scene_z;
-      bits.push(`scene ${p.scene_z.toFixed(2)}`);
-      // positive = the pivot sits deeper than the surface under it, i.e. you are
-      // orbiting a point buried behind the thing you are looking at
-      bits.push(`${d >= 0 ? "+" : ""}${d.toFixed(2)} ${d >= 0 ? "behind" : "in front"}`);
-    }
-    bits.push(`r ${p.radius.toFixed(2)}`);
-    if (p.auto) bits.push("auto");
-    ctx.font = "10px monospace";
-    const t = bits.join("  ");
-    const tw = ctx.measureText(t).width;
-    ctx.fillStyle = "rgba(20,22,28,0.65)";
-    ctx.fillRect(4, 4, tw + 8, 14);
-    ctx.fillStyle = `rgba(${col},0.9)`;
-    ctx.fillText(t, 8, 14);
   }
 
   draw() {
     const ctx = this.ctx;
+    // The backing store follows the element, or a wider node just upscales a
+    // 384px buffer however large preview_size is. Strip constants stay in
+    // backing pixels, so the buttons keep a constant on-screen size.
+    const cw = Math.round(this.canvas.clientWidth);
+    const ch = Math.round(this.canvas.clientHeight);
+    if (cw > 0 && ch > 0 && (this.canvas.width !== cw || this.canvas.height !== ch)) {
+      this.canvas.width = cw;
+      this.canvas.height = ch;
+    }
     const W = this.canvas.width, H = this.canvas.height;
     const boxH = H - CTRL_H;
     ctx.clearRect(0, 0, W, H);
@@ -542,7 +668,7 @@ class PreviewEditor {
     const n = this.frames(), f = this.frame();
     const kfs = this.kfs();
     const onKey = this.keyIndex() >= 0;
-    const keying = !!this.w("use_keyframes")?.value;
+    const keying = this.keying();   // one source of truth for "is a path driving this"
 
     // keyframe drop / remove, lit when the playhead sits on one
     ctx.fillStyle = onKey ? "rgba(120,190,255,0.28)" : "rgba(255,255,255,0.07)";
@@ -551,13 +677,17 @@ class PreviewEditor {
     ctx.fillStyle = onKey ? "rgba(170,210,255,0.95)" : DIM;
     ctx.fillText("key", k.x0 + (k.x1 - k.x0 - ctx.measureText("key").width) / 2, k.y1 - 6);
 
-    // source / warp toggle
-    ctx.fillStyle = this.mode === "source" ? "rgba(120,190,255,0.22)" : "rgba(255,255,255,0.07)";
+    // view switch
+    // Named for where it TAKES you, matching the sphere's own button. Drawn over
+    // the image, so it gets an opaque backing rather than a translucent one.
+    ctx.fillStyle = "rgba(24,32,48,0.82)";
     ctx.fillRect(m.x0, m.y0, m.x1 - m.x0, m.y1 - m.y0);
-    ctx.font = "10px monospace";
-    ctx.fillStyle = this.mode === "source" ? "rgba(170,210,255,0.95)" : DIM;
-    const mt = this.mode === "source" ? "source" : "warp";
-    ctx.fillText(mt, m.x0 + (m.x1 - m.x0 - ctx.measureText(mt).width) / 2, m.y1 - 6);
+    ctx.fillStyle = "rgba(120,190,255,0.22)";
+    ctx.fillRect(m.x0, m.y0, m.x1 - m.x0, m.y1 - m.y0);
+    ctx.font = "11px monospace";
+    ctx.fillStyle = "rgba(180,215,255,0.95)";
+    const mt = "switch to orbit";
+    ctx.fillText(mt, m.x0 + (m.x1 - m.x0 - ctx.measureText(mt).width) / 2, m.y1 - 7);
 
     // play / pause
     ctx.fillStyle = this.img ? "rgba(225,229,240,0.85)" : DIM;
@@ -574,6 +704,14 @@ class PreviewEditor {
       ctx.fill();
     }
 
+    // pivot depth-plane overlay
+    const ig = this.isoGeom();
+    ctx.fillStyle = this.iso ? `rgba(${ISO_COL},0.28)` : "rgba(255,255,255,0.07)";
+    ctx.fillRect(ig.x0, ig.y0, ig.x1 - ig.x0, ig.y1 - ig.y0);
+    ctx.font = "10px monospace";
+    ctx.fillStyle = this.iso ? `rgba(${ISO_COL},0.95)` : DIM;
+    ctx.fillText("iso", ig.x0 + (ig.x1 - ig.x0 - ctx.measureText("iso").width) / 2, ig.y1 - 6);
+
     // reset to defaults
     ctx.fillStyle = this.armed ? "rgba(230,200,90,0.30)" : "rgba(255,255,255,0.07)";
     ctx.fillRect(r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0);
@@ -589,52 +727,70 @@ class PreviewEditor {
       const t = (f - 1) / (n - 1);
       ctx.fillStyle = "rgba(120,170,255,0.55)";
       ctx.fillRect(g.x0, g.y - 2, (g.x1 - g.x0) * t, 4);
-      // keyframe ticks, so the timing of the move is readable at a glance
-      ctx.fillStyle = keying ? "rgba(130,200,255,0.9)" : "rgba(130,200,255,0.35)";
+      // Round markers, big enough to right-click. Ticks were 2px wide and
+      // effectively unhittable.
+      ctx.fillStyle = keying ? "rgba(130,200,255,0.92)" : "rgba(130,200,255,0.35)";
       for (const kf of kfs) {
-        const tt = clamp((Math.round(+kf.f) - 1) / (n - 1), 0, 1);
-        ctx.fillRect(g.x0 + (g.x1 - g.x0) * tt - 1, g.y - 7, 2, 14);
+        const kx = this.kfX(kf);
+        if (kx == null) continue;
+        ctx.beginPath();
+        ctx.arc(kx, g.y, KF_R, 0, Math.PI * 2);
+        ctx.fill();
       }
+      // The playhead is a RING drawn last, so sitting on a keyframe reads as a
+      // ring around a dot rather than one disc hiding another.
       ctx.beginPath();
-      ctx.arc(g.x0 + (g.x1 - g.x0) * t, g.y, 5, 0, Math.PI * 2);
-      ctx.fillStyle = onKey ? "rgba(210,235,255,1.0)" : "rgba(150,190,255,0.95)";
-      ctx.fill();
+      ctx.arc(g.x0 + (g.x1 - g.x0) * t, g.y, KF_R + 2.5, 0, Math.PI * 2);
+      ctx.strokeStyle = "rgba(236,244,255,0.95)";
+      ctx.lineWidth = 2;
+      ctx.stroke();
     }
 
-    // The readout. These numbers are the point of the node for now: find the
-    // pose here, then type it into the CrossView Warp node.
     // While a move is running the widgets are not what is on screen, so the
     // server sends back the pose it actually rendered.
     const ps = this.pivot?.pose;
     const v = (key, name, d = 1) =>
       (ps ? ps[key] : (this.w(name)?.value ?? 0)).toFixed(d);
     ctx.font = "12px monospace";
+    const left = `az ${v("az", "azimuth")}   el ${v("el", "elevation")}   ` +
+                 `dist ${v("dist", "distance", 2)}`;
+    const leftW = ctx.measureText(left).width;
     ctx.fillStyle = "rgba(225,229,240,0.92)";
-    ctx.fillText(`az ${v("az", "azimuth")}   el ${v("el", "elevation")}   ` +
-                 `dist ${v("dist", "distance", 2)}`, pad, H - 5);
+    ctx.fillText(left, pad, H - 5);
 
+    // Most important first; what no longer fits beside the pose readout is
+    // dropped rather than drawn over it.
     ctx.font = "10px monospace";
-    const right = [`f${f}/${n}`];
-    // Between keyframes the path drives the camera, so dragging would write
-    // into widgets that no longer feed the render. Say so rather than let it
-    // look broken.
-    if (this.auditioning) right.push(`kf ${kfs.length} aiming - KEY to commit`);
-    else if (keying && kfs.length >= 2) right.push(onKey ? `kf ${kfs.length} on key`
-                                                         : `kf ${kfs.length} between`);
-    else if (kfs.length) right.push(`kf ${kfs.length}`);
-    if (this.ms != null) right.push(`${this.ms} ms`);
-    if (this.info?.mb) right.push(`${this.info.mb} MB`);
-    if (this.stale) right.push("stale");
-    const t = right.join("  ");
-    ctx.fillStyle = this.stale ? "rgba(230,200,90,0.8)" : DIM;
-    ctx.fillText(t, W - pad - ctx.measureText(t).width, H - 5);
+    const cand = [`f${f}/${n}`];
+    if (this.stale) cand.push("stale");
+    if (this.auditioning) cand.push(`kf ${kfs.length} aiming - KEY to commit`);
+    else if (keying) cand.push(onKey ? `kf ${kfs.length} on key`
+                                     : `kf ${kfs.length} between`);
+    else if (kfs.length) cand.push(`kf ${kfs.length}`);
+    if (this.iso) cand.push("iso");
+    if (this.ms != null) cand.push(`${this.ms} ms`);
+    if (this.info?.mb) cand.push(`${this.info.mb} MB`);
+    const avail = W - pad * 2 - leftW - 12;
+    const shown = [];
+    for (const c of cand) {
+      if (ctx.measureText([...shown, c].join("  ")).width > avail) break;
+      shown.push(c);
+    }
+    if (shown.length) {
+      const t = shown.join("  ");
+      ctx.fillStyle = this.stale ? "rgba(230,200,90,0.8)" : DIM;
+      ctx.fillText(t, W - pad - ctx.measureText(t).width, H - 5);
+    }
   }
 }
 
 // Two copies of this package can be installed side by side (a dev worktree next
 // to the released one), so the extension name must be unique per directory.
 const PKG = (import.meta.url.match(/\/extensions\/([^/]+)\//) || [, "core"])[1];
-const BASE = "CrossViewPreview";
+// The preview widget attaches to the warp node itself - one node carries both
+// the orbit sphere and this viewfinder. The endpoint slug is still derived from
+// the node id, so a suffixed dev copy keeps its own route.
+const BASE = "CrossViewWarp";
 
 app.registerExtension({
   name: `crossview.livePreview.${PKG}`,
@@ -678,8 +834,9 @@ app.registerExtension({
         canvas.style.touchAction = "none";     // pointer events, not scrolling
         container.appendChild(canvas);
 
-        const h = () => Math.round(
-          Math.max(WIDGET_H, Math.min(H_MAX, (node.size?.[0] ?? 384) * 0.85)));
+        // 0 while the sphere has the floor, so the hidden canvas leaves no gap
+        const h = () => ((node._crossviewView || "orbit") === "orbit" ? 0 : Math.round(
+          Math.max(WIDGET_H, Math.min(H_MAX, (node.size?.[0] ?? 384) * 0.85))));
 
         const wd = node.addDOMWidget("preview", "crossviewPreviewWidget", container, {
           serialize: false,
@@ -694,6 +851,12 @@ app.registerExtension({
         if (wd) wd.serialize = false;
 
         node._crossviewPreview = new PreviewEditor(node, canvas, endpoint, DEFAULTS);
+        // Published so the sphere can drive the same switch from its own button.
+        node._crossviewApplyView = () => applyView(node);
+        node._crossviewSetView = (v) => setView(node, v);
+        if (!node._crossviewView) node._crossviewView = "orbit";
+        // after both widgets exist, whichever order they were created in
+        setTimeout(() => applyView(node), 0);
 
         const onRemoved = node.onRemoved;
         node.onRemoved = function () {
@@ -735,6 +898,9 @@ app.registerExtension({
     const onConn = node.onConnectionsChange;
     node.onConnectionsChange = function () {   // args forwarded via `arguments`
       const r = onConn?.apply(this, arguments);
+      // a rewiring changes which widgets the node will ignore, and it may make
+      // the cached clip no longer what the graph would produce
+      this._crossviewSyncHidden?.();
       const ed = this._crossviewPreview;
       if (ed && ed.info) {
         ed.stale = true;

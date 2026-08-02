@@ -1,40 +1,22 @@
-"""CrossView Warp with a live viewfinder.
+"""Live viewfinder for the CrossView Warp node.
 
-This node produces the same `warp` and `orbit_view` outputs as the plain warp
-node - it calls the same build() - and on top of that caches the clip so the
-browser can re-warp it interactively. One node instead of two: the pose dialled
-in on the widget is the pose that reaches the IC-LoRA guide, with no numbers
-copied across. Keyframed moves are authored on the playhead - scrub, aim, press
-KEY - which needs none of the sphere's even-spreading machinery, because the
-playhead already knows which frame was meant. camera_info stays on the plain node.
+Registers no node of its own: it hangs a cache off the end of build() and serves
+a route that re-warps frames from it, so the widget can orbit the camera and
+scrub the clip without re-running the graph. A node's inputs only exist inside
+its execute call, and ComfyUI has no API for reading them afterwards - hence the
+cache. Run once, scrub afterwards.
 
-The warp is fast enough to be interactive - a single frame at 384 px costs
-~29 ms through the full unmodified build() - so the only real obstacle to a
-draggable preview is DATA: a node's inputs exist solely inside its execute
-call, and ComfyUI has no API for "hand me node X's current input" without
-running the graph. So this node caches the clip when the graph runs, and an
-HTTP route re-warps frames from that cache while the browser drags the camera
-and scrubs the playhead. Run once, scrub afterwards.
-
-Two things make the preview agree with the real run rather than merely
-resemble it:
+Two details keep the preview equal to the real run rather than merely close:
 
   * build() derives the pivot, the roll-lock correction and the subject cloud
-    from frame 0 of whatever batch it is handed, so a request renders the
-    2-frame batch [frame 0, frame i] and keeps warp[1]. Handing it frame i
-    alone silently re-estimates all three from the wrong frame - measured at up
-    to 14.7/255 mean error with an automatic pivot.
-  * _depth_to_z normalises against the 1st/99th percentile of the WHOLE stack,
-    which a 2-frame batch cannot reproduce. The percentiles are therefore taken
-    once over the full clip at cache time and applied here, with the resulting
-    z handed to build() through its metric-geometry path (which uses z as given
-    instead of re-normalising it).
+    from frame 0 of whatever batch it gets, so a request renders [frame 0,
+    frame i] and keeps warp[1]. Frame i alone measured up to 14.7/255 of error.
+  * _depth_to_z normalises against the whole stack's 1st/99th percentiles, which
+    two frames cannot reproduce, so they are taken once over the full clip and
+    the resulting z goes in through build()'s metric-geometry path.
 
-The camera maths itself is never reimplemented: a preview whose only job is to
-predict the real output must not become a second, separately-drifting copy of
-it. Since fx is derived from the frame width, downscaling also scales the
-focal, which makes a small preview geometrically identical to the full-size
-warp rather than approximately so.
+The camera maths is never reimplemented here; fx follows the frame width, so a
+downscaled preview is geometrically identical rather than approximate.
 """
 
 import asyncio
@@ -51,9 +33,7 @@ import torch
 from . import crossview_warp_node as cvw
 from .crossview_warp_node import NODE_SUFFIX
 
-# Whole clips now, not single frames - roughly 1 MB per frame at the default
-# size, so a couple of entries is already a lot of memory and more would be
-# hoarding. The cached size is logged and shown in the widget.
+# Roughly 1.8 MB per frame at the default preview size.
 _CACHE = OrderedDict()
 _CACHE_MAX = 2
 _CACHE_LOCK = threading.Lock()
@@ -62,15 +42,12 @@ _CACHE_LOCK = threading.Lock()
 # in flight, and the lock also scopes the ProgressBar swap in _render_sync.
 _RENDER_LOCK = threading.Lock()
 
-# Half-width of the "pivot depth plane" highlight, as a fraction of the pivot's
-# own depth. Wide enough to catch a whole subject, narrow enough that it does
-# not swallow the background.
+# Half-width of the pivot depth-plane highlight, as a fraction of pivot z.
 _PIVOT_BAND = 0.06
 _ISO_COLOUR = np.array([80.0, 220.0, 200.0], dtype=np.float32)
 
-# build() logs things worth saying once per run - which becomes a flood when a
-# drag replays that same call twenty times a second. The flag is THREAD-LOCAL,
-# so a real graph execution running at the same time keeps every line.
+# build() logs once per run, which a drag turns into twenty lines a second.
+# Thread-local, so a concurrent graph execution keeps its logging.
 _quiet = threading.local()
 
 
@@ -85,10 +62,8 @@ if not getattr(logging.root, "_crossview_preview_filter", False):
     logging.root.addFilter(_QuietDuringPreview())
     logging.root._crossview_preview_filter = True
 
-# Scrubbable parameters, with the defaults used when the browser omits one.
-# Keyframes are excluded on purpose - this previews one pose at a time, and a
-# path needs a timeline to be worth previewing. camera_info likewise: it is a
-# link, so it has no value outside execution.
+# Build kwargs the browser may set, with fallbacks. Keyframes and camera_info
+# are handled separately: one needs a timeline, the other is a link.
 _PARAMS = {
     "azimuth": (float, -30.0),
     "elevation": (float, 20.0),
@@ -208,50 +183,19 @@ class _Capture:
         return False
 
 
-def _pivot_info(entry, zi, kw, cap):
-    """Where the pivot is, in both views, and how it sits against the scene.
-
-    The image position is only half the story and usually the boring half: the
-    camera looks AT the pivot, so in the warped view it lands dead centre unless
-    keep_source_aim is on with an off-axis pivot. The useful part is the depth
-    comparison - whether the point you are orbiting sits on the subject or
-    floats in front of or behind it - and the orbit radius it implies.
-    """
-    h, w = entry["rgb"].shape[1:3]
+def _pivot_info(kw, cap):
+    """Where the pivot lands in the warped view, for the crosshair."""
     pivot = cap.get("pivot")
-    if pivot is None:                       # source view never runs build()
+    if pivot is None:                       # camera_info: _orbit_C_tgt never ran
         pivot = np.array([kw["pivot_x"], kw["pivot_y"], kw["pivot_z"]], dtype=np.float64)
-    fx = cap.get("fx")
-    if fx is None:
-        deg = kw["hfov"] if kw["hfov"] > 0 else 50.0
-        fx = w / (2.0 * np.tan(np.radians(deg) / 2.0))
-
-    out = {"auto": not bool(kw["pivot_override"]),
-           "z": float(pivot[2]),
-           # eye = pivot + dist * (R @ -pivot), so the arc the camera sweeps has
-           # radius dist*|pivot| - which is why pushing pivot_z back also widens
-           # the orbit instead of only moving its centre.
-           "radius": float(np.linalg.norm(pivot)) * float(kw["distance"])}
-
-    # Source view: _warp_frame unprojects about the image centre, so that is the
-    # principal point the pivot has to be projected back through.
-    if pivot[2] > 1e-6:
-        su = float(pivot[0] / pivot[2] * fx + w / 2.0)
-        sv = float(pivot[1] / pivot[2] * fx + h / 2.0)
-        out["src_u"], out["src_v"] = su, sv
-        iu, iv = int(round(su)), int(round(sv))
-        if 0 <= iu < w and 0 <= iv < h and zi is not None:
-            sz = float(zi[iv, iu])
-            if np.isfinite(sz):
-                out["scene_z"] = sz
-
+    out = {"auto": not bool(kw["pivot_override"])}
     C = cap.get("C_tgt")
-    if C is not None:
-        Ci = np.linalg.inv(C)
-        xd = Ci[:3, :3] @ pivot + Ci[:3, 3]
-        if xd[2] > 1e-6:
-            out["u"] = float(xd[0] / xd[2] * fx + cap["cx"])
-            out["v"] = float(xd[1] / xd[2] * fx + cap["cy"])
+    if C is None:
+        return out
+    xd = np.linalg.inv(C)[:3, :3] @ pivot + np.linalg.inv(C)[:3, 3]
+    if xd[2] > 1e-6:
+        out["u"] = float(xd[0] / xd[2] * cap["fx"] + cap["cx"])
+        out["v"] = float(xd[1] / xd[2] * cap["fx"] + cap["cy"])
     return out
 
 
@@ -270,7 +214,20 @@ def _iso_tint(rgb_i, zi, pivot_z):
     return img
 
 
-def _render_array(entry, frame, params, mode="warp"):
+def _adopt(kw, sample):
+    """Copy a sampled pose into the build kwargs.
+
+    The pivot too: it is part of the pose now, and the pivot readout and the
+    depth-plane overlay both read it from here.
+    """
+    for dst, src in (("azimuth", "az"), ("elevation", "el"), ("distance", "dist"),
+                     ("vertical_shift", "vs"), ("pivot_x", "px"), ("pivot_y", "py"),
+                     ("pivot_z", "pz")):
+        if src in sample:
+            kw[dst] = sample[src]
+
+
+def _render_array(entry, frame, params, iso=False):
     """Render one frame of the cached clip -> (uint8 HxWx3, frame no, pivot info).
 
     Split out from _render_sync so the fidelity test can compare raw pixels:
@@ -281,44 +238,34 @@ def _render_array(entry, frame, params, mode="warp"):
     n = entry["n"]
     i = int(np.clip(int(frame) - 1, 0, n - 1))
 
-    # A keyframed move cannot simply be forwarded: build() interpolates by
-    # BUFFER INDEX (_sample_path(path, i + 1) over the batch it was handed), and
-    # _parse_keyframes rejects any frame number past that batch - so a keyframe
-    # at frame 37 would raise on a 2-frame request. The path is therefore
-    # sampled here with the node's own _sample_path and handed over as a
-    # SYNTHETIC 2-point path: f=1 carrying the move's midpoint pose, f=2 the
-    # playhead's. build() then estimates roll-lock at (B+1)//2 = 1, i.e. at the
-    # true midpoint exactly as the full run does, and the frame that is kept
-    # renders at the playhead pose. Frame 1's warp is discarded, and the pivot,
-    # roll and subject-cloud estimates come from its depth and image rather than
-    # its pose, so nothing else moves. With only two keyframes, sampled exactly
-    # at both ends, easing and the spline are no-ops - hence linear/linear.
+    # build() interpolates by buffer index and rejects frames past the batch, so
+    # the real path cannot go to a 2-frame request. Sample it here instead and
+    # hand over a synthetic path: f=1 the move's midpoint, f=2 the playhead.
+    # build() then estimates roll-lock at (B+1)//2 = 1, the true midpoint, and
+    # renders the kept frame at the playhead pose. Two keyframes sampled at both
+    # ends make easing and the spline no-ops.
     kpath = None
     if params.get("use_keyframes"):
-        kfs = cvw._parse_keyframes(params.get("keyframes", ""), n, kw["vertical_shift"])
+        kfs = cvw._parse_keyframes(params.get("keyframes", ""), n, kw["vertical_shift"],
+                                   (kw["pivot_x"], kw["pivot_y"], kw["pivot_z"]))
         if len(kfs) >= 2:
             path = cvw._prepare_path(kfs)
             motion = str(params.get("interp_motion") or "linear")
             smooth_path = str(params.get("interpolation")) == "smooth"
             mid = cvw._sample_path(path, (n + 1) // 2, motion, smooth_path)
             cur = cvw._sample_path(path, i + 1, motion, smooth_path)
-            kpath = json.dumps([
-                {"f": 1, "az": mid[0], "el": mid[1], "dist": mid[2], "vs": mid[3]},
-                {"f": 2, "az": cur[0], "el": cur[1], "dist": cur[2], "vs": cur[3]}])
+            kpath = json.dumps([{"f": 1, **mid}, {"f": 2, **cur}])
             # the readout should report the pose actually rendered, not the
             # static widgets the path has overridden
-            (kw["azimuth"], kw["elevation"], kw["distance"], kw["vertical_shift"]) = cur
+            _adopt(kw, cur)
         elif len(kfs) == 1:
             # build() treats a lone keyframe as the static pose; matching that
             # here keeps the preview from showing the widgets instead.
-            (kw["azimuth"], kw["elevation"], kw["distance"],
-             kw["vertical_shift"]) = kfs[0][1], kfs[0][2], kfs[0][3], kfs[0][4]
+            _adopt(kw, kfs[0])
 
-    # Frame 0 rides along because build() estimates the pivot, the roll-lock
-    # correction and the subject cloud from the batch's FIRST frame. Dropping it
-    # would re-estimate all three from frame i and quietly disagree with the run.
-    # A keyframed request always needs two, even at the playhead's frame 1, so
-    # the midpoint pose has a slot to sit in.
+    # build() estimates the pivot, roll-lock and subject cloud from the batch's
+    # FIRST frame, so frame 0 rides along. A keyframed request always needs two,
+    # even at frame 1, to carry the midpoint pose.
     idx = [0] if (i == 0 and kpath is None) else [0, i]
 
     rgb = entry["rgb"][idx]                                  # uint8 [k,H,W,3]
@@ -339,255 +286,143 @@ def _render_array(entry, frame, params, mode="warp"):
             _smooth_inplace(d32, rgb)
         lo, hi = entry["lohi"][(smooth, invert)]
         z = _z_from(d32, invert, kw["depth_ratio"], lo, hi)
-        # Handed over as metric geometry so build() takes z as given. Without
-        # `intrinsics`, hfov=0 falls back to 50 degrees there exactly as it does
-        # on the depth path with nothing else connected.
+        # As metric geometry, so build() takes z as given. Without `intrinsics`
+        # hfov=0 falls back to 50, the same as the depth path.
         moge = {"depth": torch.from_numpy(z)}
 
-    # Depth for the requested frame: the LAST of the batch, matching warp[-1].
-    zi = entry["moge_z"][i] if entry["moge_z"] is not None else z[-1]
+    zb = entry["moge_z"][idx] if entry["moge_z"] is not None else z
 
-    # The source view needs no warp. It still needs build() when the pivot is
-    # estimated rather than given, because that estimate only exists in there.
-    arr, cap = None, {}
-    if mode != "source" or not kw["pivot_override"]:
-        with _RENDER_LOCK, _Capture() as cap:
-            # build() drives the node progress bar, which outside an execution
-            # has no node to attribute itself to - and at drag rates it would
-            # spam the websocket. Swapped rather than parameterised so the
-            # released node needs no edit; the cost is that a real run starting
-            # inside this window loses its progress bar for that one run, which
-            # self-heals on the next.
-            saved = cvw.ProgressBar
-            cvw.ProgressBar = None
-            _quiet.on = True
-            bkw = dict(kw)
-            if kpath is not None:
-                bkw.update(use_keyframes=True, keyframes=kpath, frame_count=0,
-                           interp_motion="linear", interpolation="linear")
-            try:
-                warp, _orbit = cvw.CrossViewWarp().build(
-                    frames=frames, depth=None, moge_geometry=moge, **bkw)
-            finally:
-                cvw.ProgressBar = saved
-                _quiet.on = False
-        if mode != "source":
-            arr = (warp[-1].clamp(0, 1).numpy() * 255.0).astype(np.uint8)
+    if iso:
+        # Tinted into the source pixels BEFORE warping, so the highlight lands
+        # where those surfaces end up. Cosmetic only: z is already computed and
+        # build() skips smoothing on the metric path, so rgb feeds nothing but
+        # the warp colours. The preview is an annotated warp while this is on.
+        pz = kw["pivot_z"]
+        if not kw["pivot_override"]:
+            # the estimate only exists inside build(), so it costs one extra pass
+            with _RENDER_LOCK, _Capture() as cap0:
+                saved0 = cvw.ProgressBar
+                cvw.ProgressBar = None
+                _quiet.on = True
+                try:
+                    cvw.CrossViewWarp().build(frames=frames, depth=None,
+                                              moge_geometry=moge, **kw)
+                finally:
+                    cvw.ProgressBar = saved0
+                    _quiet.on = False
+            if cap0.get("pivot") is not None:
+                pz = float(cap0["pivot"][2])
+        tinted = rgb.copy()
+        for k in range(tinted.shape[0]):
+            tinted[k] = _iso_tint(tinted[k], zb[k], pz)
+        frames = torch.from_numpy(tinted.astype(np.float32) / 255.0)
 
-    info = _pivot_info(entry, zi, kw, cap)
+    cap = {}
+    with _RENDER_LOCK, _Capture() as cap:
+        # build() drives the node progress bar, which has no node to attribute
+        # itself to out here and would spam the websocket at drag rates. A real
+        # run starting inside this window loses its bar for that run only.
+        saved = cvw.ProgressBar
+        cvw.ProgressBar = None
+        _quiet.on = True
+        bkw = dict(kw)
+        # Replayed from the cache. With it connected build() takes the pose from
+        # there and ignores the angles, the pivot and the path.
+        if entry["cam"] is not None:
+            bkw["camera_info"] = entry["cam"]
+        if kpath is not None:
+            bkw.update(use_keyframes=True, keyframes=kpath, frame_count=0,
+                       interp_motion="linear", interpolation="linear")
+        try:
+            warp, _orbit = cvw.CrossViewWarp().build(
+                frames=frames, depth=None, moge_geometry=moge, **bkw)
+        finally:
+            cvw.ProgressBar = saved
+            _quiet.on = False
+    arr = (warp[-1].clamp(0, 1).numpy() * 255.0).astype(np.uint8)
+
+    info = _pivot_info(kw, cap)
     # During a keyframed move the static widgets no longer describe what is on
     # screen, so the pose that was actually rendered travels back with it.
     info["pose"] = {"az": kw["azimuth"], "el": kw["elevation"], "dist": kw["distance"],
-                    "vs": kw["vertical_shift"]}
-    info["keyed"] = kpath is not None
-    if arr is None:
-        arr = _iso_tint(entry["rgb"][i], zi, info["z"])
+                    "vs": kw["vertical_shift"], "px": kw["pivot_x"], "py": kw["pivot_y"],
+                    "pz": kw["pivot_z"]}
+    info["iso"] = bool(iso)
     return arr, i + 1, info
 
 
-def _render_sync(entry, frame, params, mode="warp"):
+def _render_sync(entry, frame, params, iso=False):
     """As _render_array, JPEG-encoded for the wire."""
-    arr, no, info = _render_array(entry, frame, params, mode)
+    arr, no, info = _render_array(entry, frame, params, iso)
     from PIL import Image
     buf = io.BytesIO()
     Image.fromarray(arr).save(buf, format="JPEG", quality=88)
     return buf.getvalue(), no, info
 
 
-class CrossViewPreview:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "frames": ("IMAGE", {
-                    "tooltip": "Input video frames - the same ones you feed the CrossView Warp "
-                    "node. The whole clip is cached, downscaled, so you can scrub it."}),
-                "preview_size": ("INT", {"default": 384, "min": 128, "max": 768, "step": 32,
-                    "tooltip": "Longest side of the preview, in pixels. The warp is scale-"
-                    "invariant, so a small preview shows the same geometry as the full-size run "
-                    "- this trades sharpness and memory for frame rate. Changing it needs a "
-                    "re-run, since it is what the clip is cached at."}),
-                "frame_index": ("INT", {"default": 1, "min": 1, "max": 100000, "step": 1,
-                    "tooltip": "Playhead, counted from 1. Scrub the bar under the preview or "
-                    "press play; this widget follows along and can also be typed into. Changing "
-                    "it does NOT need a re-run."}),
-                "azimuth": ("FLOAT", {"default": -30.0, "min": -180.0, "max": 180.0, "step": 1.0,
-                    "tooltip": "Horizontal orbit angle (deg). Drag the preview left/right to set "
-                    "it. Negative = camera orbits LEFT."}),
-                "elevation": ("FLOAT", {"default": 20.0, "min": -90.0, "max": 90.0, "step": 1.0,
-                    "tooltip": "Vertical orbit angle (deg). Drag the preview up/down to set it. "
-                    "Positive = camera rises."}),
-                "distance": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 3.0, "step": 0.05,
-                    "tooltip": "Camera distance (1.0 = same as source). Mouse wheel over the "
-                    "preview."}),
-                "hfov": ("FLOAT", {"default": 50.0, "min": 0.0, "max": 120.0, "step": 1.0,
-                    "tooltip": "Assumed horizontal field of view (deg). Same meaning as on the "
-                    "warp node; 0 reads it from moge_geometry."}),
-                "depth_ratio": ("FLOAT", {"default": 6.0, "min": 1.5, "max": 1000.0, "step": 0.5,
-                    "tooltip": "Max far/near depth ratio. Ignored with moge_geometry connected. "
-                    "One of the settings this preview is most useful for - scrub it and watch "
-                    "the relief change."}),
-            },
-            "optional": {
-                "vertical_shift": ("FLOAT", {"default": 0.0, "min": -1.0, "max": 1.0, "step": 0.02, "tooltip": "Vertical lens shift as a fraction of image height: slides the rendered frame, positive moves the picture DOWN. Not a camera move, so it cannot change parallax."}),
-                "smooth_depth": ("BOOLEAN", {"default": False,
-                    "tooltip": "Edge-aware depth smoothing before warping."}),
-                "invert_depth": ("BOOLEAN", {"default": False,
-                    "tooltip": "Flip depth polarity. Leave FALSE for the standard DA-V2 node."}),
-                "roll_lock": ("BOOLEAN", {"default": True,
-                    "tooltip": "Keep the subject's in-image lean the same as the source."}),
-                "pivot_override": ("BOOLEAN", {"default": True,
-                    "tooltip": "Orbit around the explicit pivot below instead of an estimated "
-                    "one."}),
-                "pivot_x": ("FLOAT", {"default": 0.0, "min": -1000.0, "max": 1000.0, "step": 0.01,
-                    "tooltip": "Pivot X (+ = right), in depth units."}),
-                "pivot_y": ("FLOAT", {"default": 0.0, "min": -1000.0, "max": 1000.0, "step": 0.01,
-                    "tooltip": "Pivot Y (+ = down), in depth units."}),
-                "pivot_z": ("FLOAT", {"default": 1.05, "min": 0.01, "max": 1000.0, "step": 0.01,
-                    "tooltip": "Pivot depth. Note that the orbit radius is the pivot's distance "
-                    "from the camera, so raising this widens the arc as well as moving it back."}),
-                "keep_source_aim": ("BOOLEAN", {"default": False,
-                    "tooltip": "Keep the source camera's aim while orbiting instead of turning to "
-                    "face the pivot. Only bites with an off-axis pivot."}),
-                "use_keyframes": ("BOOLEAN", {"default": False,
-                    "tooltip": "Animate the camera along the 'keyframes' path instead of holding "
-                    "one pose. Turned on for you once a second keyframe exists."}),
-                "keyframes": ("STRING", {"default": "", "multiline": False,
-                    "tooltip": "Camera path as JSON - you normally never type in here. Scrub to a "
-                    "frame, aim the camera by dragging the preview, and press the KEY button under "
-                    "it to drop a keyframe at that exact frame; press it again on the same frame "
-                    "to remove it. Unlike the orbit sphere, nothing has to be spread out "
-                    "afterwards, because the playhead already knows which frame you meant. "
-                    'Example: [{"f":1,"az":-30,"el":20,"dist":1.0,"vs":0.0},{"f":49,"az":45,'
-                    '"el":10,"dist":1.2,"vs":0.15}] . "vs" is the vertical lens shift and is '
-                    "OPTIONAL - a keyframe without one inherits the static vertical_shift widget, "
-                    "so paths written before it existed behave exactly as they did. Before the "
-                    "first and after the last keyframe the pose is held."}),
-                "interp_motion": (["linear", "ease_in_out", "ease_in", "ease_out"],
-                                  {"default": "linear",
-                    "tooltip": "Timing between consecutive keyframes. Applied per segment, so "
-                    "ease_in_out settles the camera into every keyframe. Pair easing with "
-                    "interpolation='linear'; with 'smooth' it cancels the continuity the spline "
-                    "is there to provide."}),
-                "interpolation": (["linear", "smooth"], {"default": "linear",
-                    "tooltip": "Shape of the path through the keyframes. linear = straight legs "
-                    "with a corner at each one; smooth = Catmull-Rom spline gliding through them. "
-                    "With only two keyframes the two are identical."}),
-                "depth": ("IMAGE", {
-                    "tooltip": "Depth map for the same frames, from Depth Anything V2."}),
-                "moge_geometry": ("MOGE_GEOMETRY", {
-                    "tooltip": "Metric geometry from Run MoGe Inference, used INSTEAD of the "
-                    "depth image."}),
-            },
-            "hidden": {"unique_id": "UNIQUE_ID"},
-        }
+def seed_cache(unique_id, frames, depth=None, moge_geometry=None, camera_info=None,
+               preview_size=384):
+    """Keep a downscaled copy of the clip so the browser can re-warp it.
 
-    RETURN_TYPES = ("IMAGE", "IMAGE")
-    RETURN_NAMES = ("warp", "orbit_view")
-    OUTPUT_TOOLTIPS = (
-        "The warp control video, identical to the CrossView Warp node's - connect to the "
-        "IC-LoRA reference guide for the WARP stream.",
-        "Front view of the orbit globe with the camera marker at the requested az/el/dist.",
-    )
-    FUNCTION = "seed"
-    CATEGORY = "CrossView"
-    # Both an output node AND a source of outputs: OUTPUT_NODE keeps it running
-    # when nothing downstream needs it, which is what a session spent only
-    # scrubbing the preview looks like.
-    OUTPUT_NODE = True
-    DESCRIPTION = ("CrossView Warp with a live viewfinder. Produces the same warp and orbit_view "
-                   "outputs as the plain node, and additionally caches the clip so you can drag "
-                   "the preview to orbit the camera and scrub or play the video underneath it. "
-                   "Does not do keyframed camera moves or camera_info - use the plain node for "
-                   "those.")
+    Called from the end of CrossViewWarp.build() through the _PREVIEW_SINK slot,
+    so the preview is a layer over the node rather than something the node has
+    to know about. Only the inputs are cached - every pose parameter arrives per
+    request from the widget.
+    """
+    if depth is None and moge_geometry is None:
+        return
+    size = int(preview_size)
+    small = _fit(frames.detach().float().cpu(), size)
+    # build() converts frames to uint8 anyway and the round trip through /255 is
+    # exact, so this costs no fidelity and a quarter of the memory.
+    rgb = (small.clamp(0, 1).numpy() * 255.0).astype(np.uint8)
+    n, h, w = rgb.shape[:3]
 
-    def seed(self, frames, preview_size, frame_index, azimuth, elevation, distance, hfov,
-             depth_ratio, vertical_shift=0.0, smooth_depth=False, invert_depth=False, roll_lock=True,
-             pivot_override=True, pivot_x=0.0, pivot_y=0.0, pivot_z=1.05, keep_source_aim=False,
-             use_keyframes=False, keyframes="", interp_motion="linear",
-             interpolation="linear", depth=None, moge_geometry=None, unique_id=None):
-        if depth is None and moge_geometry is None:
-            raise ValueError("CrossView Preview: connect either `depth` (a depth image) or "
-                             "`moge_geometry` (metric geometry from Run MoGe Inference).")
-        size = int(preview_size)
-        small = _fit(frames.detach().float().cpu(), size)
-        # uint8 is what build() converts frames to anyway, and the round trip
-        # through /255 back to uint8 is exact - so this costs nothing in
-        # fidelity and a quarter of the memory of keeping floats.
-        rgb = (small.clamp(0, 1).numpy() * 255.0).astype(np.uint8)
-        n, h, w = rgb.shape[:3]
+    entry = {"rgb": rgb, "n": n, "depth": None, "lohi": {},
+             "moge_z": None, "moge_mask": None, "moge_K": None,
+             # a camera_info is a plain dict of numbers, so unlike the other
+             # links it can simply be kept and replayed
+             "cam": camera_info}
 
-        entry = {"rgb": rgb, "n": n, "depth": None, "lohi": {},
-                 "moge_z": None, "moge_mask": None, "moge_K": None}
+    if moge_geometry is not None:
+        md = moge_geometry.get("depth")
+        z = _fit(md[..., None].detach().float().cpu(), size).squeeze(-1).numpy()
+        mm = moge_geometry.get("mask")
+        if mm is not None:
+            m = _fit(mm[..., None].detach().float().cpu(), size, "nearest").squeeze(-1)
+            entry["moge_mask"] = (m > 0.5).numpy()
+        entry["moge_z"] = z
+        # normalised by width, so it survives the resize untouched
+        entry["moge_K"] = moge_geometry.get("intrinsics")
+    else:
+        # Exactly build()'s depth_bhw, at preview scale: clamp and channel mean
+        # AFTER the resize, in that order, or the values drift.
+        d32 = _fit(depth.detach().float().cpu(), size).clamp(0, 1).mean(dim=-1).numpy()
+        entry["depth"] = d32
+        # The percentiles _depth_to_z would measure over the whole clip, per
+        # switch combination. Smoothing is per frame, but its percentiles still
+        # have to come from a smoothed full clip.
+        for sm in (False, True):
+            try:
+                ds = _smooth_inplace(d32.copy(), rgb) if sm else d32
+            except ImportError:
+                continue     # no cv2: a real run with smooth_depth would fail too
+            for inv in (False, True):
+                entry["lohi"][(sm, inv)] = _lohi(ds, inv)
 
-        if moge_geometry is not None:
-            md = moge_geometry.get("depth")
-            z = _fit(md[..., None].detach().float().cpu(), size).squeeze(-1).numpy()
-            mm = moge_geometry.get("mask")
-            if mm is not None:
-                m = _fit(mm[..., None].detach().float().cpu(), size, "nearest").squeeze(-1)
-                entry["moge_mask"] = (m > 0.5).numpy()
-            entry["moge_z"] = z
-            # normalised by width, so it survives the resize untouched
-            entry["moge_K"] = moge_geometry.get("intrinsics")
-            if depth is not None:
-                logging.warning("CrossView Preview: both depth and moge_geometry are connected; "
-                                "using moge_geometry, as the warp node does.")
-        else:
-            # Exactly build()'s depth_bhw, at preview scale: clamp and channel
-            # mean AFTER the resize, in that order, or the values drift.
-            d32 = _fit(depth.detach().float().cpu(), size).clamp(0, 1).mean(dim=-1).numpy()
-            entry["depth"] = d32
-            # The percentiles _depth_to_z would measure over the whole clip, for
-            # every switch combination a request can ask for. Smoothing is per
-            # frame, so its variant has to be measured on a smoothed full clip
-            # even though only one frame gets smoothed per request.
-            for sm in (False, True):
-                try:
-                    ds = _smooth_inplace(d32.copy(), rgb) if sm else d32
-                except ImportError:
-                    continue     # no cv2: a real run with smooth_depth would fail too
-                for inv in (False, True):
-                    entry["lohi"][(sm, inv)] = _lohi(ds, inv)
-
-        mb = (rgb.nbytes + (entry["depth"].nbytes if entry["depth"] is not None else 0)
-              + (entry["moge_z"].nbytes if entry["moge_z"] is not None else 0)) / 1e6
-        entry["mb"] = round(mb, 1)
-
-        key = str(unique_id)
-        with _CACHE_LOCK:
-            _CACHE[key] = entry
-            _CACHE.move_to_end(key)
-            while len(_CACHE) > _CACHE_MAX:
-                _CACHE.popitem(last=False)
-        logging.info("CrossView Preview: cached %d frames at %dx%d (%.1f MB) for node %s",
-                     n, w, h, mb, key)
-
-        # The real output, at full resolution, from the same build() the preview
-        # is a viewfinder on. Producing it here is what lets one node do the job
-        # of two: the pose you dial in on the widget is the pose that reaches the
-        # IC-LoRA guide, with no numbers copied between nodes. Cached first, so a
-        # clip that makes build() fail still leaves something to look at.
-        warp, orbit = cvw.CrossViewWarp().build(
-            frames=frames, depth=depth, moge_geometry=moge_geometry,
-            azimuth=azimuth, elevation=elevation, distance=distance, hfov=hfov,
-            vertical_shift=vertical_shift, depth_ratio=depth_ratio,
-            smooth_depth=smooth_depth, invert_depth=invert_depth, roll_lock=roll_lock,
-            pivot_override=pivot_override, pivot_x=pivot_x, pivot_y=pivot_y,
-            pivot_z=pivot_z, keep_source_aim=keep_source_aim,
-            # frame_count is a UI aid for the orbit sphere's even spreading; the
-            # playhead already puts each keyframe on the frame the user chose, so
-            # there is nothing to spread and 0 keeps build() from warning about it.
-            use_keyframes=use_keyframes, frame_count=0, keyframes=keyframes,
-            interp_motion=interp_motion, interpolation=interpolation)
-
-        # `ui` tells the browser the clip length so the widget can stop claiming
-        # to be current once the source changes underneath it; `result` is the
-        # ordinary node output.
-        return {"ui": {"crossview_preview": [{"of": n, "w": w, "h": h, "mb": entry["mb"],
-                                              "source": "moge" if entry["moge_z"] is not None
-                                              else "depth"}]},
-                "result": (warp, orbit)}
+    entry["mb"] = round((rgb.nbytes
+                         + (entry["depth"].nbytes if entry["depth"] is not None else 0)
+                         + (entry["moge_z"].nbytes if entry["moge_z"] is not None else 0)) / 1e6, 1)
+    key = str(unique_id)
+    with _CACHE_LOCK:
+        _CACHE[key] = entry
+        _CACHE.move_to_end(key)
+        while len(_CACHE) > _CACHE_MAX:
+            _CACHE.popitem(last=False)
+    logging.info("CrossViewWarp: cached %d preview frames at %dx%d (%.1f MB) for node %s",
+                 n, w, h, entry["mb"], key)
+    return {"of": n, "w": w, "h": h, "mb": entry["mb"],
+            "source": "moge" if entry["moge_z"] is not None else "depth"}
 
 
 # URL-safe form of the local dev suffix, so two installed copies cannot fight
@@ -605,9 +440,8 @@ def _register_routes():
     srv = getattr(PromptServer, "instance", None)
     if srv is None:
         return
-    # PromptServer is a singleton shared by both installed copies, so it is the
-    # one place an "already registered" flag is visible to both. A duplicate
-    # aiohttp path raises at app finalisation, i.e. at startup.
+    # A duplicate aiohttp path raises at startup, and PromptServer is the one
+    # object both installed copies share to flag it.
     flag = f"_crossview_preview_route{_SLUG}"
     if getattr(srv, flag, False):
         return
@@ -626,21 +460,20 @@ def _register_routes():
             # 409, not 404: the endpoint exists, the data does not YET - the
             # browser turns this into "run the graph once", not into an error.
             return web.json_response({"error": "no cached clip - run the graph once"}, status=409)
-        mode = "source" if data.get("mode") == "source" else "warp"
+        iso = bool(data.get("iso"))
         loop = asyncio.get_running_loop()
         try:
             # Off the event loop: a ~50 ms render inline would stall every other
             # ComfyUI request for as long as the user keeps dragging.
             jpeg, frame, pivot = await loop.run_in_executor(
                 None, _render_sync, entry, data.get("frame", 1),
-                data.get("params") or {}, mode)
+                data.get("params") or {}, iso)
         except Exception as e:
             logging.exception("CrossView Preview: render failed")
             return web.json_response({"error": f"{type(e).__name__}: {e}"}, status=500)
-        # The pivot rides along in a header rather than being drawn into the
-        # JPEG, so the browser can restyle or hide the marker without asking for
-        # another render - and the returned pixels stay the warp, unannotated.
-        info = json.dumps({"frame": frame, "count": entry["n"], "mode": mode, "pivot": pivot})
+        # In a header, not drawn into the JPEG: the marker can be restyled
+        # without a re-render and the pixels stay the plain warp.
+        info = json.dumps({"frame": frame, "count": entry["n"], "pivot": pivot})
         return web.Response(body=jpeg, content_type="image/jpeg",
                             headers={"Cache-Control": "no-store",
                                      "X-Preview-Frame": str(frame),
@@ -655,8 +488,6 @@ except Exception:
                       "the node still loads, the live preview will not work")
 
 
-_PID = f"CrossViewPreview{NODE_SUFFIX}"
-_PNAME = "CrossView Live Preview" + (f" [{NODE_SUFFIX}]" if NODE_SUFFIX else "")
-
-NODE_CLASS_MAPPINGS = {_PID: CrossViewPreview}
-NODE_DISPLAY_NAME_MAPPINGS = {_PID: _PNAME}
+# Hand the cache to the node. Done here, not by an import in the warp module, so
+# the dependency stays one-way and that module still runs on its own.
+cvw._PREVIEW_SINK = seed_cache

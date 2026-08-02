@@ -144,6 +144,9 @@ function round2(v) { return Math.round(Number(v) * 100) / 100; }
 // Anything unparseable yields [] here rather than throwing: the widget is
 // user-editable text, and a half-typed edit must not break the whole canvas.
 // The node itself re-validates and reports a real error at execution time.
+// Keyframe channels this widget does not edit but must not drop.
+const EXTRA_KF_KEYS = ["vs", "px", "py", "pz"];
+
 function parseKfs(raw) {
   if (typeof raw !== "string" || !raw.trim()) return [];
   let data;
@@ -153,12 +156,14 @@ function parseKfs(raw) {
   for (const kf of data) {
     if (!kf || typeof kf !== "object") continue;
     const f = Number(kf.f), az = Number(kf.az), el = Number(kf.el), dist = Number(kf.dist);
-    // `vs` is the per-keyframe vertical lens shift, authored on the live
-    // preview's playhead. This sphere has no control for it, but it must be
-    // carried through or editing a path here would silently erase it.
-    const vs = kf.vs === undefined ? undefined : Number(kf.vs);
+    // Authored on the live preview's playhead. No control for them here, but
+    // they must survive or editing a path here would erase them.
     if (![f, az, el, dist].every(Number.isFinite)) continue;
-    out.push({ f: Math.round(f), az, el, dist, ...(vs === undefined ? {} : { vs }) });
+    const extra = {};
+    for (const key of EXTRA_KF_KEYS) {
+      if (kf[key] !== undefined && Number.isFinite(Number(kf[key]))) extra[key] = Number(kf[key]);
+    }
+    out.push({ f: Math.round(f), az, el, dist, ...extra });
   }
   out.sort((a, b) => a.f - b.f);
   return out;
@@ -339,7 +344,9 @@ class OrbitEditor {
     // repaint when the number widgets change externally (cheap change-detect)
     this._raf = () => {
       if (!this.canvas.isConnected) return;   // node removed -> stop
-      this.render(false);
+      // Skip the work while the live preview has the floor: this polls the
+      // widgets every frame and there is nothing on screen to poll for.
+      if ((this.node._crossviewView || "orbit") === "orbit") this.render(false);
       requestAnimationFrame(this._raf);
     };
     requestAnimationFrame(this._raf);
@@ -400,7 +407,14 @@ class OrbitEditor {
   }
   // Re-read the widgets every frame so hand-edits to the `keyframes` string and
   // the interpolation / use_keyframes toggles show up on the sphere.
+  // The real clip length, once a run has cached it. frame_count was only the
+  // hint this widget needed while nothing knew it.
+  clipFrames() {
+    return Math.round(this.node._crossviewClipFrames || 0);
+  }
+
   _syncFromWidgets() {
+    this.node._crossviewSyncHidden?.();
     this.camLinked = this._cameraInfoLinked();
     const src = this._keyframeSource();
     this.linked = src.linked;
@@ -423,7 +437,11 @@ class OrbitEditor {
       const frames = Math.round(getW(this.node, "frame_count")?.value ?? 0);
       if (frames !== this._lastFrames) {
         this._lastFrames = frames;
-        if (frames > 1 && rescaleFrames(this.kfs, frames)) this._writeKfWidgets();
+        // Not once the real length is known: playhead keyframes are absolute
+        // against that clip, and refitting drags the last onto the final frame.
+        if (!this.clipFrames() && frames > 1 && rescaleFrames(this.kfs, frames)) {
+          this._writeKfWidgets();
+        }
       }
     }
     const sm = getW(this.node, "interpolation")?.value;
@@ -441,23 +459,27 @@ class OrbitEditor {
       w.value = this.kfs.length
         ? JSON.stringify(this.kfs.map((k) => ({
             f: k.f, az: round1(k.az), el: round1(k.el), dist: round2(k.dist),
-            ...(k.vs === undefined || !Number.isFinite(k.vs) ? {} : { vs: round2(k.vs) }),
+            ...Object.fromEntries(EXTRA_KF_KEYS
+              .filter((key) => Number.isFinite(k[key]))
+              .map((key) => [key, round2(k[key])])),
           })))
         : "";
       this._lastKfRaw = w.value;   // our own write must not look like a hand-edit
     }
-    // Follow the path only when it CROSSES the "is there a move at all"
-    // threshold: gaining a second keyframe turns the move on, dropping below
-    // two turns it off. Deliberately not set on every write — otherwise
-    // nudging a marker would override a user who had just switched the move
-    // off to compare against the static pose.
-    const usable = this.kfs.length >= 2;
-    if (usable !== (this._lastKfCount >= 2)) {
+    // Follow the path only when it CROSSES "is there a path at all". One
+    // keyframe counts: build() honours a lone keyframe as the static pose, so
+    // leaving the flag off would make placing one look like it did nothing.
+    // Deliberately not set on every write — otherwise nudging a marker would
+    // override a user who had just switched the move off to compare against
+    // the static pose.
+    const usable = this.kfs.length >= 1;
+    if (usable !== (this._lastKfCount >= 1)) {
       const wu = getW(this.node, "use_keyframes");
       if (wu) wu.value = usable;
     }
     this._lastKfCount = this.kfs.length;
     this.node._crossviewSyncHidden?.();
+    this.node._crossviewPreview?.request();   // same: no callback fires from here
     this.node.setDirtyCanvas(true, true);
   }
   onKeyframeClick(x, y) {
@@ -475,7 +497,7 @@ class OrbitEditor {
     // re-spread on every add/remove — but only while the timing is still the
     // automatic one. Checked BEFORE the list changes, since a freshly appended
     // keyframe would never match the spread.
-    const count = Math.round(getW(this.node, "frame_count")?.value ?? 0);
+    const count = this.clipFrames() || Math.round(getW(this.node, "frame_count")?.value ?? 0);
     const respread = count > 1 && isAutoTimed(this.kfs, count);
 
     // Right-click on an existing marker deletes just that one.
@@ -530,6 +552,13 @@ class OrbitEditor {
       dist: getW(this.node, "distance")?.value ?? 1,
     };
   }
+  // Both canvases carry a switch: the hidden one cannot offer a way back.
+  // Labelled with where it takes you, or it reads as a state badge.
+  viewGeom() {
+    const W = this.canvas.width, H = this.canvas.height;
+    return { x0: W - 106, x1: W - 6, y0: 6, y1: 26 };
+  }
+
   canvasPos(e) {
     const r = this.canvas.getBoundingClientRect();
     return [
@@ -551,6 +580,11 @@ class OrbitEditor {
     // the keyframe gesture would start a view drag underneath itself.
     if (e.button !== 0) return;
     const [x, y] = this.canvasPos(e);
+    const vg = this.viewGeom();
+    if (x >= vg.x0 && x <= vg.x1 && y >= vg.y0 && y <= vg.y1) {
+      this.node._crossviewSetView?.("warp");     // orbit -> warp; the ring goes on there
+      return;
+    }
     // ORDER MATTERS: camera handle first — if it sits ON a snap dot, the dot
     // must not steal the grab (that made the handle feel "stuck").
     if (this._resetBtn && Math.hypot(x - this._resetBtn[0], y - this._resetBtn[1]) < 14) {
@@ -670,7 +704,7 @@ class OrbitEditor {
     this._syncFromWidgets();
     const { az, el, dist } = this.vals();
     const g = this.geom();
-    const kfKey = `${this.kfs.map((k) => `${k.f},${k.az.toFixed(1)},${k.el.toFixed(1)},${k.dist.toFixed(2)}`).join(";")}|${this.smoothPath ? 1 : 0}|${this.useKeyframes ? 1 : 0}|${this.linked ? 1 : 0}${this.linkedUnknown ? "?" : ""}|${this.camLinked ? 1 : 0}`;
+    const kfKey = `${this.kfs.map((k) => `${k.f},${k.az.toFixed(1)},${k.el.toFixed(1)},${k.dist.toFixed(2)}`).join(";")}|${this.smoothPath ? 1 : 0}|${this.useKeyframes ? 1 : 0}|${this.linked ? 1 : 0}${this.linkedUnknown ? "?" : ""}|${this.camLinked ? 1 : 0}|${this.node._crossviewView || ""}`;
     const key = `${az}|${el}|${dist}|${this.view.viewYaw.toFixed(3)}|${this.view.viewTilt.toFixed(3)}|${kfKey}|${this.canvas.width}x${this.canvas.height}`;
     if (!force && key === this._renderKey) return;
     this._renderKey = key;
@@ -852,7 +886,23 @@ class OrbitEditor {
       ctx.fillStyle = (this.camLinked || this.linkedUnknown)
         ? "rgba(230,200,90,0.75)" : "rgba(200,204,216,0.45)";
       ctx.font = "11px monospace";
+      // centred in the space LEFT of the view button, not in the whole canvas -
+      // a hint of any length used to run underneath it
       ctx.fillText(hint, (W - ctx.measureText(hint).width) / 2, H - 8);
+    }
+
+    // view switch
+    if (this.node._crossviewSetView) {
+      const vg = this.viewGeom();
+      ctx.globalAlpha = 1.0;
+      ctx.fillStyle = "rgba(24,32,48,0.82)";
+      ctx.fillRect(vg.x0, vg.y0, vg.x1 - vg.x0, vg.y1 - vg.y0);
+      ctx.fillStyle = "rgba(120,190,255,0.22)";
+      ctx.fillRect(vg.x0, vg.y0, vg.x1 - vg.x0, vg.y1 - vg.y0);
+      ctx.font = "11px monospace";
+      ctx.fillStyle = "rgba(180,215,255,0.95)";
+      const vt = "switch to warp";
+      ctx.fillText(vt, vg.x0 + (vg.x1 - vg.x0 - ctx.measureText(vt).width) / 2, vg.y1 - 6);
     }
   }
 }
@@ -897,8 +947,9 @@ app.registerExtension({
         // the height track the node width keeps the canvas roughly square, so
         // widening the node actually enlarges the globe; clamped at both ends so
         // it can neither collapse nor run away.
-        const globeH = () => Math.round(
-          Math.max(WIDGET_H, Math.min(GLOBE_H_MAX, (node.size?.[0] ?? 360) * 0.85)));
+        // 0 once the live preview has the floor, so the hidden canvas leaves no gap
+        const globeH = () => ((node._crossviewView || "orbit") !== "orbit" ? 0 : Math.round(
+          Math.max(WIDGET_H, Math.min(GLOBE_H_MAX, (node.size?.[0] ?? 360) * 0.85))));
 
         const orbitWidget = node.addDOMWidget("orbit", "crossviewOrbitWidget", container, {
           serialize: false,
@@ -914,6 +965,8 @@ app.registerExtension({
         // before this fix carry one extra trailing entry.
         if (orbitWidget) orbitWidget.serialize = false;
         node._crossviewOrbit = new OrbitEditor(node, canvas);
+        // Applied once both widgets exist, whichever order they were created in.
+        setTimeout(() => node._crossviewApplyView?.(), 0);
 
         // While a keyframed move is active the static azimuth/elevation/distance
         // do nothing, so hide them rather than leave three dead controls that
@@ -924,22 +977,96 @@ app.registerExtension({
         // the Vue node renderer reads widget.options.hidden and does NOT fall
         // back to the former. Setting only one leaves them visible in one of the
         // two frontends.
+        // One control instead of two. interp_motion and interpolation stay as
+        // the stored values - widget values are positional - but only this
+        // drives them, which makes the easing+spline pairing unreachable.
+        // serialize:false, so it claims no slot.
+        const MOTIONS = ["linear", "ease_in", "ease_out", "ease_in_out", "smooth"];
+        const derivedMotion = () => (getW(node, "interpolation")?.value === "smooth"
+          ? "smooth" : (getW(node, "interp_motion")?.value ?? "linear"));
+        const motionW = node.addWidget("combo", "motion", derivedMotion(), (v) => {
+          const wm = getW(node, "interp_motion"), wi = getW(node, "interpolation");
+          if (!wm || !wi) return;
+          if (v === "smooth") { wi.value = "smooth"; wm.value = "linear"; }
+          else { wi.value = "linear"; wm.value = v; }
+          // written straight onto the widgets, so their callbacks - which is how
+          // the live preview learns to re-render - have to be poked by hand
+          node._crossviewPreview?.request();
+          node.setDirtyCanvas(true, true);
+        }, { values: MOTIONS, serialize: false });
+        motionW.serialize = false;
+        motionW.tooltip = "Shape and timing of the camera path in one control. linear = " +
+          "straight legs, constant speed. ease_in / ease_out / ease_in_out = the same legs " +
+          "with the camera settling into every keyframe. smooth = a Catmull-Rom spline " +
+          "gliding through them with no corner. Writes the interp_motion and interpolation " +
+          "widgets, which are kept hidden because their values are stored positionally.";
+        // next to the path it belongs to, not at the bottom of the node
+        const at = node.widgets.findIndex((w) => w.name === "interpolation");
+        if (at >= 0) node.widgets.splice(at + 1, 0, node.widgets.pop());
+
+        // Widgets the node ignores under the current wiring are hidden rather
+        // than left looking live - 17 of 21 with camera_info and moge connected.
+        // ONLY these are ours. Forcing hidden=false on everything else would
+        // fight the frontend over, say, a widget converted to an input.
+        const MANAGED = new Set([
+          "azimuth", "elevation", "distance", "hfov", "roll_lock", "pivot_override",
+          "pivot_x", "pivot_y", "pivot_z", "use_keyframes", "keyframes",
+          "keep_source_aim", "depth_ratio", "invert_depth", "smooth_depth",
+          "frame_count", "interp_motion", "interpolation",
+        ]);
         node._crossviewSyncHidden = () => {
-          const active = node.widgets?.find((w) => w.name === "use_keyframes")?.value === true;
+          const val = (n) => node.widgets?.find((x) => x.name === n)?.value;
+          const linked = (n) => node.inputs?.some((i) => i.name === n && i.link != null) === true;
+          const cam = linked("camera_info");
+          const moge = linked("moge_geometry");
+          const keying = val("use_keyframes") === true;
+          // retired, and superseded by the merged control
+          const hide = new Set(["frame_count", "interp_motion", "interpolation"]);
+          if (cam) {
+            // an explicit camera replaces the whole pose ESTIMATION
+            for (const n of ["azimuth", "elevation", "distance", "hfov", "roll_lock",
+                             "pivot_override", "pivot_x", "pivot_y", "pivot_z",
+                             "use_keyframes", "keyframes", "keep_source_aim"]) hide.add(n);
+          } else {
+            // the static three do nothing while a move is running, and the path
+            // controls do nothing while one is not
+            for (const n of keying ? ["azimuth", "elevation", "distance"] : ["keyframes"]) {
+              hide.add(n);
+            }
+            if (val("pivot_override") !== true) {
+              for (const n of ["pivot_x", "pivot_y", "pivot_z"]) hide.add(n);
+            }
+          }
+          // metric depth arrives in real metres: no relief to guess, no polarity
+          // to flip, nothing to denoise
+          if (moge) for (const n of ["depth_ratio", "invert_depth", "smooth_depth"]) hide.add(n);
+
           let changed = false;
-          for (const name of ["azimuth", "elevation", "distance"]) {
-            const w = node.widgets?.find((x) => x.name === name);
-            if (!w || w.hidden === active) continue;
-            w.hidden = active;
-            if (w.options) w.options.hidden = active;
-            changed = true;
+          for (const w of node.widgets ?? []) {
+            if (!MANAGED.has(w.name)) continue;
+            const want = hide.has(w.name);
+            if (w.hidden !== want) {
+              w.hidden = want;
+              if (w.options) w.options.hidden = want;
+              changed = true;
+            }
+          }
+          // the merged control follows the path controls it stands in for
+          const mw = node.widgets?.find((w) => w.name === "motion");
+          if (mw) {
+            const want = cam || !keying;
+            if (mw.hidden !== want) {
+              mw.hidden = want;
+              if (mw.options) mw.options.hidden = want;
+              changed = true;
+            }
+            const d = derivedMotion();
+            if (mw.value !== d) mw.value = d;   // follows a workflow load, or a hand edit
           }
           // Deliberately NO setSize/computeSize here. computeSize() returns the
           // node's minimum layout size, so calling it on a visibility change threw
           // away a manual resize: the node snapped smaller and jumped, which looked
-          // like it was tearing its own links off. Repainting is enough — the
-          // frontend lays hidden widgets out on its own; worst case a small gap is
-          // left where they were.
+          // like it was tearing its own links off. Repainting is enough.
           if (changed) node.setDirtyCanvas(true, true);
         };
         node._crossviewSyncHidden();
