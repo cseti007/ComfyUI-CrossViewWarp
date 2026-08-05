@@ -783,21 +783,20 @@ class CrossViewWarp:
                     "ON, since otherwise the node estimates the pivot and there is nothing to "
                     "animate. Before the first and after the last keyframe the pose is held, so a "
                     "path may cover only part of the clip. Empty = no move."}),
-                "interp_motion": (["linear", "ease_in_out", "ease_in", "ease_out"], {"default": "linear",
-                    "tooltip": "Timing between consecutive keyframes. linear = constant speed; "
-                    "ease_in_out = slow start & end (applied per segment, so the camera settles "
-                    "into every keyframe); ease_in / ease_out = one-sided. Pair easing with "
-                    "interpolation='linear' - with 'smooth' it cancels the very continuity the "
-                    "spline provides. Only used when 'use_keyframes' is ON."}),
+                # Shape AND timing in one control. "smooth" is not an easing -
+                # _ease falls through to identity for it - it is the value that
+                # drives the hidden `interpolation` widget, which keeps its slot
+                # because widget values are positional.
+                "interp_motion": (["linear", "ease_in", "ease_out", "ease_in_out", "smooth"],
+                                  {"default": "linear",
+                    "tooltip": "Shape and timing of the camera path. linear = straight legs at "
+                    "constant speed. ease_in / ease_out / ease_in_out = the same legs with the "
+                    "camera settling into every keyframe. smooth = a Catmull-Rom spline gliding "
+                    "through the keyframes with no corner. Only used when 'use_keyframes' is ON."}),
                 "interpolation": (["linear", "smooth"], {"default": "linear",
-                    "tooltip": "Shape of the path through the keyframes. linear = straight legs "
-                    "with a corner at each keyframe. smooth = Catmull-Rom spline that glides "
-                    "through them with no corner (still passes exactly through every keyframe). "
-                    "With only two keyframes the two are identical. Only used when 'use_keyframes' "
-                    "is ON."}),
-                # NEW WIDGET - appended, never inserted. ComfyUI stores widget
-                # values positionally, so putting this anywhere above would
-                # shift every later value in already-saved workflows.
+                    "tooltip": "Set by 'interp_motion' and hidden in the UI. Kept because widget "
+                    "values are stored positionally and removing it would shift every value "
+                    "after it in saved workflows."}),
                 "keep_source_aim": ("BOOLEAN", {"default": False,
                     "tooltip": "Keep the SOURCE camera's aim while orbiting, instead of turning "
                     "to face the pivot. This is what the training data does: the dataset moves "
@@ -1005,7 +1004,9 @@ class CrossViewWarp:
                if use_keyframes else [])
         path = _prepare_path(kfs) if kfs else None
         keyframing = bool(len(kfs) >= 2 and B > 1) and ci_C is None
-        smooth_path = (interpolation == "smooth")
+        # "smooth" on either: the widget carries it, and interp_motion is what
+        # the UI actually offers, so a headless call using only that still works.
+        smooth_path = "smooth" in (interpolation, interp_motion)
         if keyframing:
             # middle frame, 1-based: frames run 1..B
             mid = _sample_path(path, (B + 1) // 2, interp_motion, smooth_path)

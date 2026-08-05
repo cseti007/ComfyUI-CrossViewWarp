@@ -977,35 +977,25 @@ app.registerExtension({
         // the Vue node renderer reads widget.options.hidden and does NOT fall
         // back to the former. Setting only one leaves them visible in one of the
         // two frontends.
-        // One control instead of two. interp_motion and interpolation stay as
-        // the stored values - widget values are positional - but only this
-        // drives them, which makes the easing+spline pairing unreachable.
-        // serialize:false, so it claims no slot.
-        const MOTIONS = ["linear", "ease_in", "ease_out", "ease_in_out", "smooth"];
-        const derivedMotion = () => (getW(node, "interpolation")?.value === "smooth"
-          ? "smooth" : (getW(node, "interp_motion")?.value ?? "linear"));
-        const motionW = node.addWidget("combo", "motion", derivedMotion(), (v) => {
-          const wm = getW(node, "interp_motion"), wi = getW(node, "interpolation");
-          if (!wm || !wi) return;
-          if (v === "smooth") { wi.value = "smooth"; wm.value = "linear"; }
-          else { wi.value = "linear"; wm.value = v; }
-          // written straight onto the widgets, so their callbacks - which is how
-          // the live preview learns to re-render - have to be poked by hand
-          node._crossviewPreview?.request();
-          node.setDirtyCanvas(true, true);
-        }, { values: MOTIONS, serialize: false });
-        motionW.serialize = false;
-        motionW.tooltip = "Shape and timing of the camera path in one control. linear = " +
-          "straight legs, constant speed. ease_in / ease_out / ease_in_out = the same legs " +
-          "with the camera settling into every keyframe. smooth = a Catmull-Rom spline " +
-          "gliding through them with no corner. Writes the interp_motion and interpolation " +
-          "widgets, which are kept hidden because their values are stored positionally.";
-        // next to the path it belongs to, not at the bottom of the node
-        const at = node.widgets.findIndex((w) => w.name === "interpolation");
-        if (at >= 0) node.widgets.splice(at + 1, 0, node.widgets.pop());
+        // "smooth" on interp_motion selects the spline, so it drives the hidden
+        // `interpolation` widget. On the callback only, never continuously: a
+        // saved workflow may carry the old easing+spline pairing, and enforcing
+        // the invariant on load would silently change what it renders.
+        const wmw = getW(node, "interp_motion");
+        if (wmw) {
+          const prevCb = wmw.callback;
+          wmw.callback = function (v) {
+            const wi = getW(node, "interpolation");
+            if (wi) wi.value = v === "smooth" ? "smooth" : "linear";
+            const r = prevCb?.apply(this, arguments);
+            node._crossviewPreview?.request();
+            node.setDirtyCanvas(true, true);
+            return r;
+          };
+        }
 
         // Widgets the node ignores under the current wiring are hidden rather
-        // than left looking live - 17 of 21 with camera_info and moge connected.
+        // than left looking live - 16 of 21 with camera_info and moge connected.
         // ONLY these are ours. Forcing hidden=false on everything else would
         // fight the frontend over, say, a widget converted to an input.
         const MANAGED = new Set([
@@ -1020,19 +1010,19 @@ app.registerExtension({
           const cam = linked("camera_info");
           const moge = linked("moge_geometry");
           const keying = val("use_keyframes") === true;
-          // retired, and superseded by the merged control
-          const hide = new Set(["frame_count", "interp_motion", "interpolation"]);
+          // retired; interpolation is driven by interp_motion
+          const hide = new Set(["frame_count", "interpolation"]);
           if (cam) {
             // an explicit camera replaces the whole pose ESTIMATION
             for (const n of ["azimuth", "elevation", "distance", "hfov", "roll_lock",
                              "pivot_override", "pivot_x", "pivot_y", "pivot_z",
-                             "use_keyframes", "keyframes", "keep_source_aim"]) hide.add(n);
+                             "use_keyframes", "keyframes", "interp_motion",
+                             "keep_source_aim"]) hide.add(n);
           } else {
             // the static three do nothing while a move is running, and the path
             // controls do nothing while one is not
-            for (const n of keying ? ["azimuth", "elevation", "distance"] : ["keyframes"]) {
-              hide.add(n);
-            }
+            for (const n of keying ? ["azimuth", "elevation", "distance"]
+                                   : ["keyframes", "interp_motion"]) hide.add(n);
             if (val("pivot_override") !== true) {
               for (const n of ["pivot_x", "pivot_y", "pivot_z"]) hide.add(n);
             }
@@ -1050,18 +1040,6 @@ app.registerExtension({
               if (w.options) w.options.hidden = want;
               changed = true;
             }
-          }
-          // the merged control follows the path controls it stands in for
-          const mw = node.widgets?.find((w) => w.name === "motion");
-          if (mw) {
-            const want = cam || !keying;
-            if (mw.hidden !== want) {
-              mw.hidden = want;
-              if (mw.options) mw.options.hidden = want;
-              changed = true;
-            }
-            const d = derivedMotion();
-            if (mw.value !== d) mw.value = d;   // follows a workflow load, or a hand edit
           }
           // Deliberately NO setSize/computeSize here. computeSize() returns the
           // node's minimum layout size, so calling it on a visibility change threw
