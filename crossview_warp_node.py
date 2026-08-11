@@ -868,6 +868,11 @@ class CrossViewWarp:
     )
     FUNCTION = "build"
     CATEGORY = "CrossView"
+    # An execution ends at an output node, which is what lets the frontend offer
+    # "Run Branch" on hover - run the warp alone, look at the preview, skip the
+    # generation. The cost is that queueing the graph always runs this node, but
+    # ComfyUI skips it while the inputs are unchanged.
+    OUTPUT_NODE = True
 
     def build(self, frames, azimuth, elevation, distance, hfov, vertical_shift, depth_ratio, smooth_depth, invert_depth,
               roll_lock=True, pivot_override=True, pivot_x=0.0, pivot_y=0.0, pivot_z=1.05,
@@ -1141,6 +1146,6 @@ class CrossViewWarp:
 
 
 _ID = f"CrossViewWarp{NODE_SUFFIX}"
-_NAME = "CrossView Warp (video -> warp)" + (f" [{NODE_SUFFIX}]" if NODE_SUFFIX else "")
+_NAME = "CrossView Warp" + (f" [{NODE_SUFFIX}]" if NODE_SUFFIX else "")
 NODE_CLASS_MAPPINGS = {_ID: CrossViewWarp}
 NODE_DISPLAY_NAME_MAPPINGS = {_ID: _NAME}

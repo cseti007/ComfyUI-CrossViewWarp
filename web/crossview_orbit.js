@@ -554,6 +554,12 @@ class OrbitEditor {
   }
   // Both canvases carry a switch: the hidden one cannot offer a way back.
   // Labelled with where it takes you, or it reads as a state badge.
+  // Top-left, mirroring the live preview's. Same two-stage arm: a camera path
+  // is real work and there is no undo here.
+  resetGeom() {
+    return { x0: 6, x1: 58, y0: 6, y1: 26 };
+  }
+
   viewGeom() {
     const W = this.canvas.width, H = this.canvas.height;
     return { x0: W - 106, x1: W - 6, y0: 6, y1: 26 };
@@ -585,13 +591,19 @@ class OrbitEditor {
       this.node._crossviewSetView?.("warp");     // orbit -> warp; the ring goes on there
       return;
     }
-    // ORDER MATTERS: camera handle first — if it sits ON a snap dot, the dot
-    // must not steal the grab (that made the handle feel "stuck").
-    if (this._resetBtn && Math.hypot(x - this._resetBtn[0], y - this._resetBtn[1]) < 14) {
-      this.view.viewYaw = 0.24; this.view.viewTilt = 0.20;
+    const rg = this.resetGeom();
+    const hitReset = this.node._crossviewReset &&
+      x >= rg.x0 && x <= rg.x1 && y >= rg.y0 && y <= rg.y1;
+    if (this.resetArmed && !hitReset) { this.resetArmed = false; this.render(true); }
+    if (hitReset) {
+      if (this.kfs.length && !this.resetArmed) { this.resetArmed = true; this.render(true); return; }
+      this.resetArmed = false;
+      this.node._crossviewReset();
       this.render(true);
       return;
     }
+    // ORDER MATTERS: camera handle first — if it sits ON a snap dot, the dot
+    // must not steal the grab (that made the handle feel "stuck").
     if (this.handle && Math.hypot(x - this.handle[0], y - this.handle[1]) <= HANDLE_R + 10) {
       this.drag = "cam";
     } else {
@@ -704,7 +716,7 @@ class OrbitEditor {
     this._syncFromWidgets();
     const { az, el, dist } = this.vals();
     const g = this.geom();
-    const kfKey = `${this.kfs.map((k) => `${k.f},${k.az.toFixed(1)},${k.el.toFixed(1)},${k.dist.toFixed(2)}`).join(";")}|${this.smoothPath ? 1 : 0}|${this.useKeyframes ? 1 : 0}|${this.linked ? 1 : 0}${this.linkedUnknown ? "?" : ""}|${this.camLinked ? 1 : 0}|${this.node._crossviewView || ""}`;
+    const kfKey = `${this.kfs.map((k) => `${k.f},${k.az.toFixed(1)},${k.el.toFixed(1)},${k.dist.toFixed(2)}`).join(";")}|${this.smoothPath ? 1 : 0}|${this.useKeyframes ? 1 : 0}|${this.linked ? 1 : 0}${this.linkedUnknown ? "?" : ""}|${this.camLinked ? 1 : 0}|${this.node._crossviewView || ""}|${this.resetArmed ? 1 : 0}`;
     const key = `${az}|${el}|${dist}|${this.view.viewYaw.toFixed(3)}|${this.view.viewTilt.toFixed(3)}|${kfKey}|${this.canvas.width}x${this.canvas.height}`;
     if (!force && key === this._renderKey) return;
     this._renderKey = key;
@@ -889,6 +901,18 @@ class OrbitEditor {
       // centred in the space LEFT of the view button, not in the whole canvas -
       // a hint of any length used to run underneath it
       ctx.fillText(hint, (W - ctx.measureText(hint).width) / 2, H - 8);
+    }
+
+    // reset to defaults
+    if (this.node._crossviewReset) {
+      const rg = this.resetGeom();
+      ctx.globalAlpha = 1.0;
+      ctx.fillStyle = this.resetArmed ? "rgba(230,200,90,0.30)" : "rgba(24,32,48,0.82)";
+      ctx.fillRect(rg.x0, rg.y0, rg.x1 - rg.x0, rg.y1 - rg.y0);
+      ctx.font = "11px monospace";
+      ctx.fillStyle = this.resetArmed ? "rgba(240,215,120,0.95)" : "rgba(200,204,216,0.7)";
+      const rt = this.resetArmed ? "sure?" : "reset";
+      ctx.fillText(rt, rg.x0 + (rg.x1 - rg.x0 - ctx.measureText(rt).width) / 2, rg.y1 - 6);
     }
 
     // view switch

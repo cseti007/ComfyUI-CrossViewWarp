@@ -336,161 +336,11 @@ class PreviewEditor {
   }
 
   // Back to the node's own defaults. A camera path is real work, so when one
-  // exists the first click only arms the button - losing a move to a stray
-  // click is not something an undo would get back here.
+  // exists the first click only arms the button.
   reset() {
     if (this.kfs().length && !this.armed) { this.armed = true; this.draw(); return; }
     this.armed = false;
-    for (const [name, val] of Object.entries(this.defaults)) {
-      // preview_size is what the clip was CACHED at; changing it without a
-      // re-run would leave the widget disagreeing with the frames on hand.
-      if (name === "preview_size") continue;
-      const wd = this.w(name);
-      if (wd) wd.value = val;
-    }
-    this.playing = false;
-    this.auditioning = false;
-    this.iso = false;
-    this._lastKfCount = 0;       // the path is gone; the next write is a fresh crossing
-    this.shownSig = null;
-    setView(this.node, "warp");
-    app.graph?.setDirtyCanvas(true, false);
-    this.request();
-  }
-
-  // --- keyframes -----------------------------------------------------------
-  // The playhead IS the frame number, so nothing needs spreading afterwards the
-  // way it does on the sphere, which has to guess the timing.
-  kfs() {
-    const raw = this.w("keyframes")?.value;
-    if (!raw) return [];
-    try {
-      const a = JSON.parse(raw);
-      return Array.isArray(a) ? a.filter((k) => k && Number.isFinite(+k.f)) : [];
-    } catch (e) { return []; }      // hand-edited into invalid JSON: the server will say so
-  }
-
-  keyIndex() {
-    const f = this.frame();
-    return this.kfs().findIndex((k) => Math.round(+k.f) === f);
-  }
-
-  writeKfs(list) {
-    list.sort((a, b) => a.f - b.f);
-    const wd = this.w("keyframes");
-    if (!wd) return;
-    wd.value = JSON.stringify(list);
-    // Flip use_keyframes only when the path appears or disappears, so someone
-    // who switched the move off to compare is not overridden by nudging a
-    // marker. One keyframe counts: build() honours it as the static pose.
-    const has = list.length >= 1;
-    if (has !== (this._lastKfCount >= 1)) {
-      const uk = this.w("use_keyframes");
-      if (uk) uk.value = has;
-    }
-    this._lastKfCount = list.length;
-    wd.callback?.(wd.value);
-    app.graph?.setDirtyCanvas(true, false);
-  }
-
-  poseNow() {
-    return {
-      az: this.w("azimuth")?.value ?? 0,
-      el: this.w("elevation")?.value ?? 0,
-      dist: this.w("distance")?.value ?? 1,
-      // the lens shift is part of the framing, and the pivot is what the camera
-      // orbits AND looks at, so both belong to the keyframe rather than being
-      // pinned globally for the whole clip
-      vs: this.w("vertical_shift")?.value ?? 0,
-      px: this.w("pivot_x")?.value ?? 0,
-      py: this.w("pivot_y")?.value ?? 0,
-      pz: this.w("pivot_z")?.value ?? 1.05,
-    };
-  }
-
-  // One keyframe counts, matching build() and the use_keyframes threshold. When
-  // these disagreed, a drag at exactly one keyframe wrote into widgets the node
-  // had stopped reading: the camera did not move and KEY stored an unseen pose.
-  keying() {
-    return !!this.w("use_keyframes")?.value && this.kfs().length >= 1;
-  }
-
-  // On a keyframe the drag edits it. Off one the path drives the camera and the
-  // widgets are stale, so they are seeded from the pose on screen first -
-  // otherwise the first drag snaps to wherever they were left.
-  beginAudition() {
-    if (this.auditioning || !this.keying() || this.keyIndex() >= 0) return;
-    const ps = this.pivot?.pose;
-    if (ps) {
-      const set = (n, v, d) => {
-        const wd = this.w(n);
-        if (wd && Number.isFinite(v)) wd.value = Math.round(v * 10 ** d) / 10 ** d;
-      };
-      set("azimuth", ps.az, 1); set("elevation", ps.el, 1);
-      set("distance", ps.dist, 2); set("vertical_shift", ps.vs, 2);
-      set("pivot_x", ps.px, 2); set("pivot_y", ps.py, 2); set("pivot_z", ps.pz, 2);
-    }
-    this.auditioning = true;
-  }
-
-  toggleKey() {
-    const list = this.kfs();
-    const i = this.keyIndex();
-    if (i >= 0) list.splice(i, 1);
-    else list.push({ f: this.frame(), ...this.poseNow() });
-    this.auditioning = false;      // committed (or removed): back on the path
-    this.writeKfs(list);
-  }
-
-  // Dragging edits the keyframe under the playhead, if there is one. Between
-  // keyframes the path is what drives the render, so a drag there would write
-  // into widgets that no longer feed anything — the readout says so instead.
-  syncKey() {
-    if (!this.w("use_keyframes")?.value) return;
-    const i = this.keyIndex();
-    if (i < 0) return;
-    const list = this.kfs();
-    list[i] = { f: this.frame(), ...this.poseNow() };
-    this.writeKfs(list);
-  }
-
-  modeGeom() {
-    const W = this.canvas.width;
-    // Top-right, out of the control strip: it is a once-in-a-while action and
-    // was crowding the scrub bar, which is used constantly.
-    return { x0: W - MODE_W - 6, x1: W - 6, y0: 6, y1: 26 };
-  }
-
-  // Screen x of a keyframe on the scrub bar, or null if the clip length is not
-  // known yet (nothing to lay it out against).
-  kfX(kf) {
-    const n = this.frames();
-    if (n < 2) return null;
-    const g = this.barGeom();
-    const t = clamp((Math.round(+kf.f) - 1) / (n - 1), 0, 1);
-    return g.x0 + (g.x1 - g.x0) * t;
-  }
-
-  // Index of the keyframe marker under a point, or -1. Generous vertically:
-  // the strip is short and the markers are small.
-  pickKf(px, py) {
-    const g = this.barGeom();
-    if (Math.abs(py - g.y) > 10) return -1;
-    const list = this.kfs();
-    let best = -1, bestD = KF_R + 4;
-    list.forEach((kf, i) => {
-      const x = this.kfX(kf);
-      if (x == null) return;
-      const d = Math.abs(px - x);
-      if (d < bestD) { bestD = d; best = i; }
-    });
-    return best;
-  }
-
-  scrubTo(x) {
-    const g = this.barGeom();
-    const t = clamp((x - g.x0) / Math.max(1, g.x1 - g.x0), 0, 1);
-    this.setFrame(1 + t * (this.frames() - 1));
+    this.node._crossviewReset?.();
   }
 
   onDown(e) {
@@ -852,6 +702,27 @@ app.registerExtension({
 
         node._crossviewPreview = new PreviewEditor(node, canvas, endpoint, DEFAULTS);
         // Published so the sphere can drive the same switch from its own button.
+        // Shared with the orbit canvas, which has a reset button of its own.
+        // preview_size is skipped: it is what the clip was CACHED at, and
+        // changing it without a re-run leaves the widget lying about the frames.
+        node._crossviewReset = () => {
+          for (const [name, val] of Object.entries(DEFAULTS)) {
+            if (name === "preview_size") continue;
+            const wd = node.widgets?.find((w) => w.name === name);
+            if (wd) wd.value = val;
+          }
+          const ed = node._crossviewPreview;
+          if (ed) {
+            ed.playing = false;
+            ed.auditioning = false;
+            ed.iso = false;
+            ed._lastKfCount = 0;
+            ed.shownSig = null;
+            ed.request();
+          }
+          node._crossviewSyncHidden?.();
+          app.graph?.setDirtyCanvas(true, true);
+        };
         node._crossviewApplyView = () => applyView(node);
         node._crossviewSetView = (v) => setView(node, v);
         if (!node._crossviewView) node._crossviewView = "orbit";
