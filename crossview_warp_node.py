@@ -675,185 +675,155 @@ class CrossViewWarp:
         return {
             "required": {
                 "frames": ("IMAGE", {
-                    "tooltip": "Input video frames (the source view). Feed the same "
-                    "frames you send to the Depth Anything V2 node."}),
+                    "tooltip": "Input video frames. Feed the same frames you send to the "
+                    "depth node."}),
                 "azimuth": ("FLOAT", {"default": -30.0, "min": -180.0, "max": 180.0, "step": 1.0,
-                    "tooltip": "Horizontal orbit angle (deg). Negative = camera orbits LEFT, "
-                    "positive = RIGHT. The strongest control. Reliable up to about +-45, usable "
-                    "to +-65; beyond that the hidden side is mostly invented."}),
+                    "tooltip": "Horizontal orbit angle (deg). Negative orbits LEFT, "
+                    "positive RIGHT. The strongest control: reliable to about "
+                    "+-45, usable to +-65, beyond that the hidden side is "
+                    "mostly invented."}),
                 "elevation": ("FLOAT", {"default": 20.0, "min": -90.0, "max": 90.0, "step": 1.0,
-                    "tooltip": "Vertical orbit angle (deg). Positive = camera rises (looks down "
-                    "on the subject), negative = looks up. NOTE: the effect is weaker/subtler "
-                    "than azimuth - the orbit is stronger horizontally."}),
+                    "tooltip": "Vertical orbit angle (deg). Positive rises above the "
+                    "subject, negative looks up from below. Weaker than azimuth "
+                    "- the orbit is stronger horizontally."}),
                 "distance": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 3.0, "step": 0.05,
-                    "tooltip": "Camera distance from the subject (1.0 = same as source). "
-                    "Below 1 = move closer / zoom in; above 1 = pull back. Extreme values "
-                    "enlarge the disoccluded (magenta) holes."}),
+                    "tooltip": "Camera distance (1.0 = same as the source). Below 1 moves "
+                    "closer, above 1 pulls back - and pulling back reveals area "
+                    "the source never framed, so the magenta holes grow. The "
+                    "current LoRA does not follow this reliably."}),
                 "hfov": ("FLOAT", {"default": 50.0, "min": 0.0, "max": 120.0, "step": 1.0,
-                    "tooltip": "Assumed HORIZONTAL camera field of view (deg). ~50 is a normal "
-                    "lens; change it if the clip is clearly wide-angle or telephoto. "
-                    "0 = read the focal length from moge_geometry's intrinsics instead - a "
-                    "fallback, not the better choice, since MoGe estimates the focal about 10% "
-                    "short. With no moge_geometry connected, 0 falls back to 50."}),
+                    "tooltip": "Assumed horizontal field of view (deg). ~50 is a normal "
+                    "lens; change it if the clip is clearly wide-angle or "
+                    "telephoto. 0 takes it from moge_geometry, which runs about "
+                    "10% short - set it yourself if you know the lens."}),
                 # Renamed from head_bias, which named the use case rather than the
                 # effect. Kept in the SAME widget position: widget values are
                 # stored positionally, so a rename in place leaves saved
                 # workflows intact (a converted-to-input link, which is stored by
                 # name, is the one thing that does not survive).
                 "vertical_shift": ("FLOAT", {"default": 0.0, "min": -1.0, "max": 1.0, "step": 0.02,
-                    "tooltip": "Vertical LENS SHIFT: slides the rendered frame up or down, as a "
-                    "fraction of image height. Positive moves the picture DOWN, i.e. the framing "
-                    "up, which is what recovers a subject whose head is clipped. This is not a "
-                    "camera move - the camera does not travel, so nothing changes parallax; the "
-                    "image is translated rigidly (measured: every point moves by the same amount, "
-                    "to 0.000 px). pivot_y reframes too while the camera aims at the pivot, but "
-                    "it stops doing so under keep_source_aim and it changes the orbit radius on "
-                    "the way; this one works in both aim modes and never touches the 3D setup. "
-                    "Leave at 0 unless the framing needs rescuing."}),
+                    "tooltip": "Vertical lens shift, as a fraction of image height. "
+                    "Positive moves the picture DOWN, i.e. the framing up, "
+                    "which rescues a clipped head. The camera does not move, so "
+                    "parallax is unchanged. Leave at 0 unless the framing needs "
+                    "it."}),
                 "depth_ratio": ("FLOAT", {"default": 6.0, "min": 1.5, "max": 1000.0, "step": 0.5,
-                    "tooltip": "Max far/near depth ratio of the scene. Lower = flatter relief and "
-                    "a cleaner warp; higher = more parallax but messier on cluttered scenes. "
-                    "Close-up faces: 2.5-4; mid shots: 4-8; deep/wide scenes: 8-16."}),
+                    "tooltip": "Max far/near depth ratio of the scene. Lower = flatter "
+                    "relief and a cleaner warp; higher = more parallax but "
+                    "messier on cluttered scenes. Close-up faces: 2.5-4; mid "
+                    "shots: 4-8; deep/wide scenes: 8-16."}),
                 "smooth_depth": ("BOOLEAN", {"default": False,
-                    "tooltip": "Edge-aware depth smoothing before warping. Turn ON if the warp "
-                    "has too many speckle holes; it trades a little sharpness for cleaner, more "
-                    "coherent disocclusion."}),
+                    "tooltip": "Edge-aware depth smoothing before warping. Turn ON if the "
+                    "warp has too many speckle holes; it trades a little "
+                    "sharpness for cleaner disocclusion."}),
                 "invert_depth": ("BOOLEAN", {"default": False,
-                    "tooltip": "Flip depth polarity (near<->far). Leave FALSE for the standard "
-                    "ComfyUI DA-V2 node. Turn ON only if the warp looks inside-out (background "
-                    "moves like foreground / the subject caves in)."}),
+                    "tooltip": "Flip depth polarity (near<->far). Leave OFF for the "
+                    "standard DA-V2 node. Turn ON only if the warp looks "
+                    "inside-out - background moving like foreground, or the "
+                    "subject caving in."}),
             },
             "optional": {
                 "roll_lock": ("BOOLEAN", {"default": True,
-                    "tooltip": "Keep the subject upright: matches its in-image lean to the source "
-                    "so a tilted source shot doesn't tip the subject over at large angles. "
-                    "Leave ON."}),
+                    "tooltip": "Keep the subject upright: matches its in-image lean to the "
+                    "source, so a tilted shot does not tip the subject over at "
+                    "large angles. Leave ON."}),
                 "pivot_override": ("BOOLEAN", {"default": True,
-                    "tooltip": "Orbit around an explicit pivot point (set below) instead of an "
-                    "auto-estimated one. ON by default with a pivot near the subject, which is "
-                    "the recommended setup."}),
+                    "tooltip": "Orbit around the explicit pivot below instead of an auto- "
+                    "estimated one. ON by default, which is the recommended "
+                    "setup."}),
                 "pivot_x": ("FLOAT", {"default": 0.0, "min": -1000.0, "max": 1000.0, "step": 0.01,
-                    "tooltip": "Pivot X in the source camera frame (+ = right), in depth units. "
-                    "0 = image centre. NOTE that by default the camera AIMS at the pivot, so "
-                    "moving this also reframes the shot - within about 3 pixels of what "
-                    "vertical_shift would do, on a 384px frame. That stops as soon as "
-                    "keep_source_aim is ON, where the aim stays on the optical axis and this "
-                    "moves the picture by exactly nothing. Moving the pivot also changes the "
-                    "orbit radius, which is dist * |pivot|, so it alters how much parallax a "
-                    "given azimuth produces."}),
+                    "tooltip": "Pivot X in the source camera frame (+ = right), in depth "
+                    "units. 0 = image centre. The camera aims at the pivot, so "
+                    "moving this also reframes the shot - unless "
+                    "keep_source_aim is ON, where it only moves the orbit "
+                    "centre."}),
                 "pivot_y": ("FLOAT", {"default": 0.0, "min": -1000.0, "max": 1000.0, "step": 0.01,
-                    "tooltip": "Pivot Y (+ = down), in depth units. 0 = image centre. Same "
-                    "caveats as pivot_x: it doubles as a vertical reframe while the camera aims "
-                    "at the pivot, does nothing to the framing once keep_source_aim is ON, and "
-                    "changes the orbit radius either way. Use vertical_shift when you want to "
-                    "reframe WITHOUT touching the 3D setup."}),
+                    "tooltip": "Pivot Y (+ = down), in depth units. 0 = image centre. "
+                    "Doubles as a reframe like pivot_x. Use vertical_shift to "
+                    "reframe without moving the camera."}),
                 "pivot_z": ("FLOAT", {"default": 1.05, "min": 0.01, "max": 1000.0, "step": 0.01,
-                    "tooltip": "Pivot depth (how far in front of the camera). ~1.05 sits on the "
-                    "nearest subject in the middle of the frame; raise it to orbit around "
-                    "something further back."}),
+                    "tooltip": "Pivot depth. ~1.05 sits on the nearest subject in the "
+                    "middle of the frame; raise it to orbit something further "
+                    "back. The orbit radius is distance * |pivot|, so this "
+                    "widens the arc as well as moving its centre."}),
                 # NOTE: new widgets MUST come after the original five optional
                 # ones (roll_lock..pivot_z). ComfyUI stores widget_values
                 # positionally in saved workflows, so inserting a widget in the
                 # middle shifts every downstream value into the wrong slot and
                 # breaks previously saved nodes on load.
                 "use_keyframes": ("BOOLEAN", {"default": False,
-                    "tooltip": "Animate the camera along the 'keyframes' path instead of holding "
-                    "one pose. When OFF, the single azimuth/elevation/distance above is applied to "
-                    "every frame. Right-click the orbit sphere to place keyframes."}),
+                    "tooltip": "Animate the camera along the keyframes path instead of "
+                    "holding one pose. Switched on for you when the first "
+                    "keyframe is placed."}),
                 "frame_count": ("INT", {"default": 0, "min": 0, "max": 100000, "step": 1,
-                    "tooltip": "RETIRED - hidden in the UI and safe to ignore. It used to tell the "
-                    "orbit sphere how long the clip was, because nothing else knew; a run now "
-                    "caches the clip for the live preview and the real length comes with it. The "
-                    "widget is kept, and still honoured if a saved workflow carries a value, only "
-                    "because widget values are stored positionally and removing one would shift "
-                    "every value after it. The node always validates keyframes against the clip it "
-                    "actually receives."}),
+                    "tooltip": "Retired and ignored. The clip length comes from the cached "
+                    "preview."}),
                 "keyframes": ("STRING", {"default": "", "multiline": False,
-                    "tooltip": "Camera path as JSON, written by right-clicking the orbit sphere "
-                    "or by parking the live preview's playhead and pressing KEY - you normally "
-                    "never type in here. Each entry is one keyframe: 'f' = frame number, "
-                    "'az'/'el' = angles in degrees, 'dist' = distance (1.0 = source). A keyframe "
-                    "may also carry 'vs' (vertical lens shift) and 'px'/'py'/'pz' (the pivot); "
-                    "those are OPTIONAL and anything left out inherits the static widget, so a "
-                    "path written before they existed behaves exactly as it did. Example: "
-                    '[{"f":1,"az":-30,"el":20,"dist":1.0,"vs":0,"px":0,"py":0,"pz":1.05},'
-                    '{"f":49,"az":45,"el":10,"dist":1.2}] . Animating the pivot swings the camera '
-                    "around one thing and then another, but the orbit radius is dist * |pivot|, so "
-                    "it moves the parallax with it; px/py/pz are ignored unless pivot_override is "
-                    "ON, since otherwise the node estimates the pivot and there is nothing to "
-                    "animate. Before the first and after the last keyframe the pose is held, so a "
-                    "path may cover only part of the clip. Empty = no move."}),
+                    "tooltip": "Camera path as JSON - normally written for you by the KEY button on the "
+                    "preview, or by right-clicking the orbit sphere. Each entry: 'f' is the "
+                    "frame number counted from 1, 'az'/'el' are degrees, 'dist' is the "
+                    "distance. Optional 'vs' (vertical shift) and 'px'/'py'/'pz' (the pivot) "
+                    "inherit the static widgets when left out; px/py/pz need pivot_override ON. "
+                    'Example: [{"f":1,"az":-30,"el":20,"dist":1.0},{"f":49,"az":45,"el":10,'
+                    '"dist":1.2}] . '
+                    "The pose is held before the first and after the last keyframe, so a path "
+                    "may cover only part of the clip. Empty = no move."}),
                 # Shape AND timing in one control. "smooth" is not an easing -
                 # _ease falls through to identity for it - it is the value that
                 # drives the hidden `interpolation` widget, which keeps its slot
                 # because widget values are positional.
                 "interp_motion": (["linear", "ease_in", "ease_out", "ease_in_out", "smooth"],
                                   {"default": "linear",
-                    "tooltip": "Shape and timing of the camera path. linear = straight legs at "
-                    "constant speed. ease_in / ease_out / ease_in_out = the same legs with the "
-                    "camera settling into every keyframe. smooth = a Catmull-Rom spline gliding "
-                    "through the keyframes with no corner. Only used when 'use_keyframes' is ON."}),
+                    "tooltip": "Shape and timing of the camera path. linear = straight "
+                    "legs at constant speed. ease_in / ease_out / ease_in_out = "
+                    "the same legs with the camera settling into every "
+                    "keyframe. smooth = a Catmull-Rom spline gliding through "
+                    "them with no corner. Only used while use_keyframes is ON."}),
                 "interpolation": (["linear", "smooth"], {"default": "linear",
-                    "tooltip": "Set by 'interp_motion' and hidden in the UI. Kept because widget "
-                    "values are stored positionally and removing it would shift every value "
-                    "after it in saved workflows."}),
+                    "tooltip": "Driven by interp_motion."}),
                 "keep_source_aim": ("BOOLEAN", {"default": False,
-                    "tooltip": "Keep the SOURCE camera's aim while orbiting, instead of turning "
-                    "to face the pivot. This is what the training data does: the dataset moves "
-                    "camera B along an arc around the subject but leaves it pointed where camera "
-                    "A was pointed, so your framing carries over rather than the subject snapping "
-                    "to the centre. Measured against the training warps on 12 scenes: aiming at "
-                    "the pivot scores 42.3, keeping the source aim 28.9, and the best possible "
-                    "(exact known pose) 26.8 - so this recovers most of the gap. OFF by default "
-                    "only because it changes the output of every saved workflow; turn it ON for "
-                    "new work. Turning it ON also stops pivot_x/pivot_y from reframing the shot: "
-                    "the aim moves onto the optical axis, so they go back to being purely the "
-                    "orbit centre and vertical_shift becomes the way to shift the framing. "
-                    "Ignored when camera_info is connected, which carries its own aim. "
-                    "Also does nothing while the pivot sits on the optical axis (pivot_x and "
-                    "pivot_y both 0, the default) - there the source aim and the pivot are the "
-                    "same point; it bites with an off-axis or automatic pivot."}),
+                    "tooltip": "Orbit around the pivot but keep the camera pointed where "
+                    "the source was pointed, so your framing carries over "
+                    "instead of the subject snapping to the centre. This is "
+                    "what the training data does: measured against the training "
+                    "warps it scores 28.9 against 42.3 for aiming at the pivot. "
+                    "OFF by default for compatibility - turn it ON for new "
+                    "work. Does nothing while the pivot sits on the optical "
+                    "axis, which is the default."}),
                 # Sockets, not widgets, so they take no widget_values slot and
                 # cannot shift the ones above in saved workflows. `depth` moved
                 # here from `required` so a metric-geometry graph does not have
                 # to wire a depth image it will not use; saved workflows already
                 # have it connected, so nothing breaks.
                 "depth": ("IMAGE", {
-                    "tooltip": "Depth map for the SAME frames, from a Depth Anything V2 node "
-                    "(DA-V2 Large). Brightness = depth; polarity is handled by invert_depth. "
-                    "Leave unconnected if you are feeding moge_geometry instead."}),
+                    "tooltip": "Depth map for the same frames, from a Depth Anything V2 "
+                    "node. Brightness = depth; polarity is handled by "
+                    "invert_depth. Leave unconnected if you are feeding "
+                    "moge_geometry instead."}),
                 "moge_geometry": ("MOGE_GEOMETRY", {
-                    "tooltip": "Metric geometry from Run MoGe Inference, used INSTEAD of the "
-                    "depth image. Depth then arrives in real metres, so depth_ratio, "
-                    "invert_depth and smooth_depth are ignored - there is no relief to guess, no "
-                    "polarity to flip and nothing to denoise - and pivot/distance become real "
-                    "distances. Measured against ground "
-                    "truth this roughly halves the warp error versus a relative depth map, "
-                    "because a relative map has no scale and the guessed one is usually wrong. "
-                    "hfov is taken from its intrinsics when hfov is 0, but MoGe estimates the "
-                    "focal ~10% short, so set hfov yourself if you know the lens."}),
+                    "tooltip": "Metric geometry from Run MoGe Inference, used instead of "
+                    "the depth image. Depth then arrives in real metres, so "
+                    "depth_ratio, invert_depth and smooth_depth no longer "
+                    "apply, and pivot and distance become real distances. "
+                    "Measured against ground truth it roughly halves the warp "
+                    "error. hfov comes from its intrinsics when hfov is 0."}),
                 "camera_info": ("LOAD3D_CAMERA", {
                     "tooltip": "Exact target camera, from Create Camera Info or a Load 3D "
-                    "viewport. When connected the pose is taken from it and azimuth, elevation, "
-                    "distance, roll_lock, the pivot_* fields and the keyframe path are ALL "
-                    "IGNORED - the camera is placed where the camera_info says, instead of being "
-                    "derived from an orbit around an estimated pivot. hfov is ignored too: the "
-                    "focal length comes from the camera_info's own (vertical) fov and zoom."}),
+                    "viewport. When connected the pose comes from it, and the "
+                    "orbit controls - angles, distance, hfov, roll_lock, the "
+                    "pivot and the keyframe path - are all ignored."}),
                 # APPENDED, never inserted: widget values are positional. The
                 # sockets above take no slot, so these land after keep_source_aim.
                 "preview_size": ("INT", {"default": 512, "min": 128, "max": 768, "step": 32,
-                    "tooltip": "Longest side, in pixels, of the clip kept for the live preview "
-                    "widget. The warp is scale-invariant, so a small preview shows the same "
-                    "geometry as the full-size run - this trades sharpness and memory for frame "
-                    "rate and memory: about 1 MB per cached frame at 384, 1.8 MB at 512, and a "
-                    "render costs roughly 47 ms at 384 against 100 ms at 512, which is what "
-                    "sets the playback rate. Changing it takes effect on the next run, "
-                    "since it is what the clip gets cached at."}),
+                    "tooltip": "Longest side the clip is cached at for the live preview. "
+                    "The warp is scale-invariant, so this trades sharpness and "
+                    "memory for frame rate: about 1 MB per frame and 18 fps at "
+                    "384, 1.8 MB and 11 fps at 512. Takes effect on the next "
+                    "run."}),
                 "frame_index": ("INT", {"default": 1, "min": 1, "max": 100000, "step": 1,
-                    "tooltip": "Playhead for the live preview, counted from 1. Scrub the bar "
-                    "under the preview or press play; this widget follows along and can be typed "
-                    "into. It does not affect the rendered output, and changing it needs no "
-                    "re-run."}),
+                    "tooltip": "Playhead for the live preview, counted from 1. The scrub "
+                    "bar under the preview drives it; it does not affect the "
+                    "output and needs no re-run."}),
             },
             "hidden": {"unique_id": "UNIQUE_ID"},
         }
