@@ -1035,10 +1035,10 @@ app.registerExtension({
           const moge = linked("moge_geometry");
           const keying = val("use_keyframes") === true;
           // retired; interpolation is driven by interp_motion
-          const hide = new Set(["frame_count", "interpolation"]);
+          const hide = new Set(["frame_count", "interpolation", "roll_lock"]);
           if (cam) {
             // an explicit camera replaces the whole pose ESTIMATION
-            for (const n of ["azimuth", "elevation", "distance", "hfov", "roll_lock",
+            for (const n of ["azimuth", "elevation", "distance", "hfov",
                              "pivot_override", "pivot_x", "pivot_y", "pivot_z",
                              "use_keyframes", "keyframes", "interp_motion",
                              "keep_source_aim"]) hide.add(n);

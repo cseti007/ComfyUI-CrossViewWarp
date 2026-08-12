@@ -8,9 +8,9 @@ cache. Run once, scrub afterwards.
 
 Two details keep the preview equal to the real run rather than merely close:
 
-  * build() derives the pivot, the roll-lock correction and the subject cloud
-    from frame 0 of whatever batch it gets, so a request renders [frame 0,
-    frame i] and keeps warp[1]. Frame i alone measured up to 14.7/255 of error.
+  * build() derives the pivot from frame 0 of whatever batch it gets, so a
+    request renders [frame 0, frame i] and keeps warp[1]. Frame i alone
+    measured up to 14.7/255 of error.
   * _depth_to_z normalises against the whole stack's 1st/99th percentiles, which
     two frames cannot reproduce, so they are taken once over the full clip and
     the resulting z goes in through build()'s metric-geometry path.
@@ -73,7 +73,6 @@ _PARAMS = {
     "depth_ratio": (float, 6.0),
     "smooth_depth": (bool, False),
     "invert_depth": (bool, False),
-    "roll_lock": (bool, True),
     "pivot_override": (bool, True),
     "pivot_x": (float, 0.0),
     "pivot_y": (float, 0.0),
@@ -150,12 +149,10 @@ def _coerce(params):
 class _Capture:
     """Record the pose build() actually used, by intercepting its own calls.
 
-    The pivot marker needs the pivot and the final target camera - and both are
-    build() internals: the pivot may be estimated from the frame rather than
-    given, and roll-lock rotates C_tgt after _orbit_C_tgt returns it. Copying
-    that derivation here would be a second implementation that drifts, so
-    instead the two functions are wrapped for the duration of the call and asked
-    what they were handed.
+    The pivot marker needs the pivot and the target camera, and the pivot may be
+    estimated from the frame rather than given. Copying that derivation here
+    would be a second implementation that drifts, so the two functions are
+    wrapped for the duration of the call and asked what they were handed.
 
     The wrappers are transparent - they record and delegate, changing nothing -
     so a real graph execution running concurrently in another thread is
@@ -241,9 +238,9 @@ def _render_array(entry, frame, params, iso=False):
     # build() interpolates by buffer index and rejects frames past the batch, so
     # the real path cannot go to a 2-frame request. Sample it here instead and
     # hand over a synthetic path: f=1 the move's midpoint, f=2 the playhead.
-    # build() then estimates roll-lock at (B+1)//2 = 1, the true midpoint, and
-    # renders the kept frame at the playhead pose. Two keyframes sampled at both
-    # ends make easing and the spline no-ops.
+    # build() reads its base pose at (B+1)//2 = 1, the true midpoint, and renders
+    # the kept frame at the playhead pose. Two keyframes sampled at both ends
+    # make easing and the spline no-ops.
     kpath = None
     if params.get("use_keyframes"):
         kfs = cvw._parse_keyframes(params.get("keyframes", ""), n, kw["vertical_shift"],
@@ -263,9 +260,9 @@ def _render_array(entry, frame, params, iso=False):
             # here keeps the preview from showing the widgets instead.
             _adopt(kw, kfs[0])
 
-    # build() estimates the pivot, roll-lock and subject cloud from the batch's
-    # FIRST frame, so frame 0 rides along. A keyframed request always needs two,
-    # even at frame 1, to carry the midpoint pose.
+    # build() estimates the pivot from the batch's FIRST frame, so frame 0 rides
+    # along. A keyframed request always needs two, even at frame 1, to carry the
+    # midpoint pose.
     idx = [0] if (i == 0 and kpath is None) else [0, i]
 
     rgb = entry["rgb"][idx]                                  # uint8 [k,H,W,3]

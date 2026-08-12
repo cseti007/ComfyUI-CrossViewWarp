@@ -28,7 +28,7 @@ const DIM = "rgba(200,204,216,0.45)";
 // frame_index is absent on purpose: it is the playhead, sent separately.
 const PARAM_NAMES = [
   "azimuth", "elevation", "distance", "hfov", "vertical_shift", "depth_ratio",
-  "smooth_depth", "invert_depth", "roll_lock", "pivot_override",
+  "smooth_depth", "invert_depth", "pivot_override",
   "pivot_x", "pivot_y", "pivot_z", "keep_source_aim",
   // The path travels with the request: the server samples it at the playhead
   // with the node's own interpolation, so the preview shows the pose the move

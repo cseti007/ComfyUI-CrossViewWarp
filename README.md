@@ -118,9 +118,6 @@ Key widgets (all have tooltips in the UI):
   for aiming at the pivot, with 26.8 the best a known-exact pose can do. Off by
   default only because it changes every saved workflow; turn it on for new work.
 - `smooth_depth` — (default off) edge-aware depth smoothing, fewer speckle holes in the warp.
-- `roll_lock` (default on) — keeps the subject's in-image lean the same as the
-  source, so a tilted source shot doesn't tip the character over at large
-  angles
 - `use_keyframes` / `keyframes` / `interp_motion` — a camera move instead of a
   single pose. See [Keyframed camera move](#keyframed-camera-move) below.
 - `preview_size` / `frame_index` — the live preview only; see below.

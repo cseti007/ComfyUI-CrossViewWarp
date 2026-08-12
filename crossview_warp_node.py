@@ -361,13 +361,6 @@ def _look_at(eye, target, world_down=np.array([0.0, 1.0, 0.0])):
     return C
 
 
-def _rodrigues(axis, ang):
-    a = axis / (np.linalg.norm(axis) + 1e-9)
-    c, s = np.cos(ang), np.sin(ang)
-    K = np.array([[0, -a[2], a[1]], [a[2], 0, -a[0]], [-a[1], a[0], 0]])
-    return np.eye(3) * c + s * K + (1 - c) * np.outer(a, a)
-
-
 def _rot_x(a):
     c, s = np.cos(a), np.sin(a)
     return np.array([[1, 0, 0], [0, c, -s], [0, s, c]])
@@ -724,9 +717,11 @@ class CrossViewWarp:
             },
             "optional": {
                 "roll_lock": ("BOOLEAN", {"default": True,
-                    "tooltip": "Keep the subject upright: matches its in-image lean to the "
-                    "source, so a tilted shot does not tip the subject over at "
-                    "large angles. Leave ON."}),
+                    "tooltip": "Retired and ignored. It rolled the camera to hold the subject's "
+                    "projected lean, but the orbit introduces no roll to correct - a level "
+                    "source gives a level target at every angle - and what it was reacting to is "
+                    "keystone from elevation, which a roll cannot fix. Both training datasets "
+                    "have exactly 0 camera roll."}),
                 "pivot_override": ("BOOLEAN", {"default": True,
                     "tooltip": "Orbit around the explicit pivot below instead of an auto- "
                     "estimated one. ON by default, which is the recommended "
@@ -809,7 +804,7 @@ class CrossViewWarp:
                 "camera_info": ("LOAD3D_CAMERA", {
                     "tooltip": "Exact target camera, from Create Camera Info or a Load 3D "
                     "viewport. When connected the pose comes from it, and the "
-                    "orbit controls - angles, distance, hfov, roll_lock, the "
+                    "orbit controls - angles, distance, hfov, the "
                     "pivot and the keyframe path - are all ignored."}),
                 # APPENDED, never inserted: widget values are positional. The
                 # sockets above take no slot, so these land after keep_source_aim.
@@ -926,7 +921,6 @@ class CrossViewWarp:
         central[H // 8: 4 * H // 5, W // 5: 4 * W // 5] = True
         fin = np.isfinite(z0) & (z0 > 0) & central
         fin &= z0 < np.percentile(z0[fin], 95.0)
-        fg = fin & (z0 < np.percentile(z0[fin], 50.0))
         Xw0 = np.stack([(uu - cc) / fx * z0, (vv - cch) / fx * z0, z0], -1)
         # pivot = median 3D point of the trimmed central region (scene-level
         # aim, matching the training warps' real-camera framing; a nearest-
@@ -995,62 +989,6 @@ class CrossViewWarp:
         C_tgt = (ci_C if ci_C is not None
                  else _orbit_C_tgt(mid_az, mid_el, mid_dist, mid_pivot, _aim_of(mid_pivot)))
 
-        # roll lock: keep the subject's projected in-image lean identical to
-        # the source by rolling the camera about its optical axis (a pitched
-        # source shot would otherwise tip the character at large azimuths).
-        # The subject cloud = depth band around the pivot + horizontal window
-        # around its projected column, so receding walls can't hijack the axis.
-        fgc = Xw0[fg].mean(0)                      # subject (nearest cluster) centre
-        pu = cc + fgc[0] / fgc[2] * fx
-        subj = fin & (np.abs(z0 - fgc[2]) < 0.3 * fgc[2]) & (np.abs(uu - pu) < 0.3 * W)
-        if subj.sum() < 500:
-            subj = fg
-        def _lean(P2):
-            """(angle, dominance) of the cloud's major axis; angle 0 = vertical.
-            Returns angle=None when the axis is ambiguous: near-isotropic cloud
-            or a near-HORIZONTAL axis, where the up-sign disambiguation flips
-            arbitrarily and produced 90-180 deg phantom rolls."""
-            P2 = P2 - P2.mean(0)
-            _ev, V2 = np.linalg.eigh(P2.T @ P2)
-            v2 = V2[:, -1]
-            if v2[1] > 0:
-                v2 = -v2                      # point up (image y is down)
-            dom = np.sqrt(_ev[-1] / max(_ev[-2], 1e-9))
-            ang = np.arctan2(v2[0], -v2[1])   # 0 = vertical, + = leaning right
-            if dom < 1.3 or abs(ang) > np.radians(45):
-                return None
-            return ang
-
-        def _lean_in(C):
-            Ci2 = np.linalg.inv(C)
-            Xd2 = (Ci2[:3, :3] @ Xw0[subj].T).T + Ci2[:3, 3]
-            m2 = Xd2[:, 2] > 0
-            return _lean(np.stack([Xd2[m2, 0] / Xd2[m2, 2], Xd2[m2, 1] / Xd2[m2, 2]], -1))
-
-        def _wrap(a):
-            return (a + np.pi) % (2 * np.pi) - np.pi
-
-        th_src = _lean(np.stack([uu[subj].astype(np.float64), vv[subj].astype(np.float64)], -1))
-        th_tgt = _lean_in(C_tgt)
-        # roll-lock correction is estimated ONCE at the midpoint pose and the
-        # same scalar `applied_droll` is then applied to every per-frame C_tgt
-        # so the subject stays upright consistently across the whole move.
-        applied_droll = 0.0
-        # roll_lock corrects a roll that the orbit construction introduces. An
-        # explicit camera_info already carries the roll the caller asked for, so
-        # "fixing" it would silently override them.
-        if roll_lock and ci_C is None and th_src is not None and th_tgt is not None:
-            droll = float(np.clip(_wrap(th_tgt - th_src), -np.radians(35), np.radians(35)))
-            err0 = abs(_wrap(th_tgt - th_src))
-            for cand in (droll, -droll):
-                C_try = C_tgt.copy()
-                C_try[:3, :3] = _rodrigues(C_tgt[:3, 2], cand) @ C_tgt[:3, :3]
-                th_try = _lean_in(C_try)
-                if th_try is not None and abs(_wrap(th_try - th_src)) < err0 - 1e-6:
-                    applied_droll = cand
-                    C_tgt = C_try
-                    break
-
         # principal point stays at the image centre (training warps use real
         # camera intrinsics, no lens shift); vertical_shift is a manual lens
         # shift only (default 0 = off) - it translates the rendered frame and
@@ -1073,9 +1011,6 @@ class CrossViewWarp:
                 fr_pivot = _pivot_of(fr)
                 C_tgt_i = _orbit_C_tgt(fr["az"], fr["el"], fr["dist"], fr_pivot,
                                        _aim_of(fr_pivot))
-                if applied_droll != 0.0:
-                    C_tgt_i = C_tgt_i.copy()
-                    C_tgt_i[:3, :3] = _rodrigues(C_tgt_i[:3, 2], applied_droll) @ C_tgt_i[:3, :3]
                 # the lens shift is part of the framing, so it keyframes with the
                 # rest of the pose rather than staying pinned to the widget
                 cy_i = cch + fr_vs * H
