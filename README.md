@@ -98,8 +98,9 @@ see is what it reads. With `camera_info` connected that is most of them.
 Key widgets (all have tooltips in the UI):
 
 - `azimuth` / `elevation` / `distance` — the camera offset. Stay in the green
-  zone of the picker: azimuth up to ±45°, elevation +30°/−15° (yellow up to
-  ±65° works with degrading quality). Avoid near-zero angles — the LoRA
+  zone of the picker: azimuth up to ±45°, elevation +30°/−20°. Yellow runs to
+  ±90° azimuth and +45°/−35°, which is what the training set covers — azimuth
+  is spread evenly out to 90°, while looking up past −20° is thin (3.1%). Avoid near-zero angles — the LoRA
   misbehaves when the warp is almost identical to the source. **Important: Unfortunately distance doesn't work as expected due to some dataset problems which will be solved in the next release.**
 - `hfov` — the assumed lens. 0 means "read it from `moge_geometry`", and shows
   as `hfov (auto)`.

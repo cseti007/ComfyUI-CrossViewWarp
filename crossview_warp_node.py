@@ -95,7 +95,8 @@ def _orbit_view_image(azimuth, elevation, distance, size=512, kfs=None, smooth=F
     R = (S / 2.0 - 4 * k) * 0.62
     yaw, tilt = 0.24, 0.20               # widget default view
 
-    ZONE_GREEN, ZONE_YELLOW = (45, 30, 15), (65, 40, 25)
+    # must stay in step with crossview_orbit.js, which this is a port of
+    ZONE_GREEN, ZONE_YELLOW = (45, 30, 20), (90, 45, 35)
     C_GREEN, C_YELLOW = (80, 200, 120), (230, 200, 90)
 
     def in_ellipse(az, el, zone):
@@ -139,8 +140,8 @@ def _orbit_view_image(azimuth, elevation, distance, size=512, kfs=None, smooth=F
     # coverage hint band (front hemisphere only, alpha 0.13)
     lay = layer(); d = ImageDraw.Draw(lay)
     STEP = 15
-    for a0 in range(-70, 70, STEP):
-        for e0 in range(-30, 45, STEP):
+    for a0 in range(-90, 90, STEP):
+        for e0 in range(-45, 45, STEP):
             col = zone_color(a0 + STEP / 2, e0 + STEP / 2)
             if col is None:
                 continue
@@ -672,13 +673,13 @@ class CrossViewWarp:
                     "depth node."}),
                 "azimuth": ("FLOAT", {"default": -30.0, "min": -180.0, "max": 180.0, "step": 1.0,
                     "tooltip": "Horizontal orbit angle (deg). Negative orbits LEFT, "
-                    "positive RIGHT. The strongest control: reliable to about "
-                    "+-45, usable to +-65, beyond that the hidden side is "
-                    "mostly invented."}),
+                    "positive RIGHT. The strongest control: +-45 is where the "
+                    "model has been checked, and the training set covers out to "
+                    "+-90 evenly. Past 90 the hidden side is invented."}),
                 "elevation": ("FLOAT", {"default": 20.0, "min": -90.0, "max": 90.0, "step": 1.0,
                     "tooltip": "Vertical orbit angle (deg). Positive rises above the "
-                    "subject, negative looks up from below. Weaker than azimuth "
-                    "- the orbit is stronger horizontally."}),
+                    "subject, negative looks up from below. UP is the weak "
+                    "direction: only 3.1% of the training set sits below -20."}),
                 "distance": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 3.0, "step": 0.05,
                     "tooltip": "Camera distance (1.0 = same as the source). Below 1 moves "
                     "closer, above 1 pulls back - and pulling back reveals area "

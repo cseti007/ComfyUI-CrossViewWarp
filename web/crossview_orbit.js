@@ -21,12 +21,14 @@ import { app } from "../../scripts/app.js";
 
 console.log("[CrossView Orbit] module loaded");
 
-// Anisotropic coverage zones from MEASURED dataset stats: azimuth is wide
-// (+-45 well trained), elevation is narrow, and DOWNWARD (camera below the
-// subject, looking up) is the weakest direction -> red kicks in sooner there.
-// Ellipse half-axes: [azimuth, elevation-up, elevation-down] in degrees.
-const ZONE_GREEN = [45, 30, 15];
-const ZONE_YELLOW = [65, 40, 25];
+// Half-axes [azimuth, elevation-up, elevation-down] in degrees, from the v2.3
+// manifest audit (719 samples). Azimuth is covered uniformly out to 90 (the
+// 75-90 band is the most populated, 18.1%), so YELLOW runs the full quarter.
+// GREEN stops at 45 because that is the only angle the trained model has
+// actually been looked at; widening it needs a sweep, not a histogram.
+// Looking UP is the weak axis: below -20 the set holds 3.1% of samples.
+const ZONE_GREEN = [45, 30, 20];
+const ZONE_YELLOW = [90, 45, 35];
 const C_GREEN = [80, 200, 120], C_YELLOW = [230, 200, 90], C_RED = [225, 95, 95];
 const SNAP_DEG = 5;
 const HANDLE_R = 14;
@@ -213,8 +215,8 @@ function renderSphere(ctx, view, cx, cy, R) {
   ctx.fillStyle = "rgba(70,74,86,0.25)";
   ctx.beginPath(); ctx.arc(cx, cy, R, 0, Math.PI * 2); ctx.fill();
   const STEP = 15;
-  for (let a0 = -70; a0 < 70; a0 += STEP) {
-    for (let e0 = -30; e0 < 45; e0 += STEP) {
+  for (let a0 = -90; a0 < 90; a0 += STEP) {
+    for (let e0 = -45; e0 < 45; e0 += STEP) {
       const col = zoneColor(a0 + STEP / 2, e0 + STEP / 2);
       if (col === C_RED) continue;
       const quad = [];
