@@ -782,14 +782,13 @@ class CrossViewWarp:
                 "interpolation": (["linear", "smooth"], {"default": "linear",
                     "tooltip": "Driven by interp_motion."}),
                 "keep_source_aim": ("BOOLEAN", {"default": False,
-                    "tooltip": "Orbit around the pivot but keep the camera pointed where "
-                    "the source was pointed, so your framing carries over "
-                    "instead of the subject snapping to the centre. This is "
-                    "what the training data does: measured against the training "
-                    "warps it scores 28.9 against 42.3 for aiming at the pivot. "
-                    "OFF by default for compatibility - turn it ON for new "
-                    "work. Does nothing while the pivot sits on the optical "
-                    "axis, which is the default."}),
+                    "tooltip": "Which point the orbiting camera looks at. OFF: it looks at the "
+                    "pivot, so the pivot sits dead centre and moving it reframes the shot. ON: it "
+                    "looks where the SOURCE camera looked, so your original framing is kept and "
+                    "the pivot is only the orbit centre. Needs pivot_x or pivot_y off zero to do "
+                    "anything - on the optical axis both aims are the same point. ON is what the "
+                    "training data does and scores 28.9 against 42.3 measured on the training "
+                    "warps; OFF by default for compatibility, turn it ON for new work."}),
                 # Sockets, not widgets, so they take no widget_values slot and
                 # cannot shift the ones above in saved workflows. `depth` moved
                 # here from `required` so a metric-geometry graph does not have
