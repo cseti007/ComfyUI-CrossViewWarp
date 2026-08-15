@@ -1,11 +1,13 @@
 # ComfyUI-CrossViewWarp
 
-The companion ComfyUI node for my
-[CrossView-Warp IC-LoRA](https://huggingface.co/Cseti/LTX2.3-22B_IC-LoRA-CrossView-Warp)
-(LTX-Video 2.3, 22B). You give it a video and a camera offset, and it builds
-the depth-warp conditioning the LoRA expects: the input reprojected into the
-new viewpoint, with magenta holes where the original camera never saw
-anything.
+The companion ComfyUI node for my CrossView-Warp IC-LoRA (LTX-Video 2.3, 22B) —
+[**v2**](https://huggingface.co/Cseti/LTX2.3-22B_IC-LoRA-CrossView-Warp_v2)
+is the current one, [v0.9](https://huggingface.co/Cseti/LTX2.3-22B_IC-LoRA-CrossView-Warp)
+the first release.
+
+You give it a video and a camera offset, and it builds the depth-warp
+conditioning the LoRA expects: the input reprojected into the new viewpoint,
+with magenta holes where the original camera never saw anything.
 
 The node carries two views, switched with the button in the top-right corner of
 the widget:
@@ -22,7 +24,7 @@ for the whole clip.
 
 This whole thing is a proof of concept. The LoRA card lists what works and
 what doesn't — read it before expecting magic:
-https://huggingface.co/Cseti/LTX2.3-22B_IC-LoRA-CrossView-Warp
+https://huggingface.co/Cseti/LTX2.3-22B_IC-LoRA-CrossView-Warp_v2
 
 ## Demo
 
@@ -76,8 +78,9 @@ pip install numba
   [kijai/ComfyUI-DepthAnythingV2](https://github.com/kijai/ComfyUI-DepthAnythingV2)
 - [VideoHelperSuite](https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite)
   for video load/save
-- The [CrossView-Warp LoRA](https://huggingface.co/Cseti/LTX2.3-22B_IC-LoRA-CrossView-Warp)
-  itself — the node only builds the conditioning, the LoRA does the generation
+- The CrossView-Warp LoRA itself — [v2](https://huggingface.co/Cseti/LTX2.3-22B_IC-LoRA-CrossView-Warp_v2)
+  or [v0.9](https://huggingface.co/Cseti/LTX2.3-22B_IC-LoRA-CrossView-Warp).
+  The node only builds the conditioning; the LoRA does the generation
 - Optional: `opencv-contrib-python` — the `smooth_depth` option uses its
   guided filter when available, and falls back to a bilateral filter when not
 
@@ -226,14 +229,36 @@ leaving a stale local path on screen.
   content the base model has strong opinions about
 - Both IC-LoRA reference guides at `latent_downscale_factor = 1` — this is the
   setting that breaks the result silently, and nothing catches a mismatch
-- Reference order **warp first, then source**, matching training. Measured, the
-  swapped order is only a few percent different, so do not treat it as the first
-  suspect when output looks wrong
 - For `distance > 1`: describe the newly revealed content in the text prompt —
   the warp can't know what's outside the original frame. 
 
 The full settings story and all the limitations are on the
-[LoRA card](https://huggingface.co/Cseti/LTX2.3-22B_IC-LoRA-CrossView-Warp).
+[LoRA card](https://huggingface.co/Cseti/LTX2.3-22B_IC-LoRA-CrossView-Warp_v2).
+
+## Upgrading an existing workflow
+
+The node id has not changed, so saved workflows load. These do change:
+
+- **`roll_lock` is gone**, and it was ON by default — so a saved workflow that
+  used the default renders differently. It rolled the camera to hold the
+  subject's projected lean, but the orbit introduces no roll to correct (a level
+  source gives a level target at every angle), what it was reacting to is
+  keystone from elevation, which a roll cannot fix, and both training sets have
+  exactly zero camera roll. The widget stays, hidden and ignored, only because
+  widget values are stored positionally. Workflows that had it OFF are
+  unchanged.
+- **`head_bias` is now `vertical_shift`.** It kept its widget slot, so ordinary
+  workflows are fine — but a link into it (converted to an input) or an
+  API-format prompt that names it will not resolve.
+- **The mouse wheel is inverted**: wheel back raises the number, matching every
+  other numeric widget in the graph.
+- **`hfov` between 0 and 20 now raises** instead of warping from an impossible
+  lens. 0 still means "read the focal from `moge_geometry`".
+- **`frame_count` and `interpolation` are retired** — hidden and ignored. The
+  clip length comes from the cached preview, and `interp_motion` carries both
+  the shape and the timing of the path.
+- `distance` reaches down to 0.1 (was 0.2). Widening a range cannot invalidate a
+  saved value.
 
 ## Support
 
