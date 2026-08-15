@@ -69,7 +69,10 @@ pip install numba
 ## Prerequisites
 
 - A recent ComfyUI with LTX-2 support (the `LTXAddVideoICLoRAGuide` node)
-- A Depth Anything V2 node pack for the depth input — I use
+- Geometry for the input clip. **MoGe is the better path and needs no install** —
+  `Run MoGe Inference` is built into ComfyUI, and it is what built the training
+  warps, so `moge_geometry` roughly halves the warp error against a relative
+  depth map. A Depth Anything V2 node pack still works on the `depth` input —
   [kijai/ComfyUI-DepthAnythingV2](https://github.com/kijai/ComfyUI-DepthAnythingV2)
 - [VideoHelperSuite](https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite)
   for video load/save
@@ -221,7 +224,11 @@ leaving a stale local path on screen.
 
 - IC-LoRA strength **1.3** for characters, **1.0–1.15** for cars and other
   content the base model has strong opinions about
-- Both IC-LoRA reference guides at `latent_downscale_factor = 1`
+- Both IC-LoRA reference guides at `latent_downscale_factor = 1` — this is the
+  setting that breaks the result silently, and nothing catches a mismatch
+- Reference order **warp first, then source**, matching training. Measured, the
+  swapped order is only a few percent different, so do not treat it as the first
+  suspect when output looks wrong
 - For `distance > 1`: describe the newly revealed content in the text prompt —
   the warp can't know what's outside the original frame. 
 
