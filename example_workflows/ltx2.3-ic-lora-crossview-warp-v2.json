@@ -4450,7 +4450,7 @@
       "widgets_values": {
         "frame_rate": 24,
         "loop_count": 0,
-        "filename_prefix": "/home/cseti/data2/AI/training/Video/output/ltx2/crossview_warp_v23_LTX2.3-22B_IC-LoRA/comfyui_user_tests/keyframetest",
+        "filename_prefix": "comfyui",
         "format": "video/h264-mp4",
         "pix_fmt": "yuv420p",
         "crf": 19,
@@ -4463,19 +4463,19 @@
           "paused": false,
           "params": {
             "filename": "keyframetest_00025-audio.mp4",
-            "subfolder": "/home/cseti/data2/AI/training/Video/output/ltx2/crossview_warp_v23_LTX2.3-22B_IC-LoRA/comfyui_user_tests",
+            "subfolder": "",
             "type": "output",
             "format": "video/h264-mp4",
             "frame_rate": 24,
             "workflow": "keyframetest_00025.png",
-            "fullpath": "/home/cseti/data2/AI/training/Video/output/ltx2/crossview_warp_v23_LTX2.3-22B_IC-LoRA/comfyui_user_tests/keyframetest_00025-audio.mp4"
+            "fullpath": ""
           }
         }
       },
       "widgets_values_named": {
         "frame_rate": 24,
         "loop_count": 0,
-        "filename_prefix": "/home/cseti/data2/AI/training/Video/output/ltx2/crossview_warp_v23_LTX2.3-22B_IC-LoRA/comfyui_user_tests/keyframetest",
+        "filename_prefix": "comfyui",
         "format": "video/h264-mp4",
         "pix_fmt": "yuv420p",
         "crf": 19,
@@ -4488,12 +4488,12 @@
           "paused": false,
           "params": {
             "filename": "keyframetest_00025-audio.mp4",
-            "subfolder": "/home/cseti/data2/AI/training/Video/output/ltx2/crossview_warp_v23_LTX2.3-22B_IC-LoRA/comfyui_user_tests",
+            "subfolder": "",
             "type": "output",
             "format": "video/h264-mp4",
             "frame_rate": 24,
             "workflow": "keyframetest_00025.png",
-            "fullpath": "/home/cseti/data2/AI/training/Video/output/ltx2/crossview_warp_v23_LTX2.3-22B_IC-LoRA/comfyui_user_tests/keyframetest_00025-audio.mp4"
+            "fullpath": ""
           }
         }
       }
@@ -4550,7 +4550,7 @@
       "widgets_values": {
         "frame_rate": 24,
         "loop_count": 0,
-        "filename_prefix": "/home/cseti/data2/AI/training/Video/output/ltx2/crossview_warp_v23_LTX2.3-22B_IC-LoRA/comfyui_user_tests/keyframetest-compa",
+        "filename_prefix": "comfyui",
         "format": "video/h264-mp4",
         "pix_fmt": "yuv420p",
         "crf": 19,
@@ -4563,19 +4563,19 @@
           "paused": false,
           "params": {
             "filename": "keyframetest-compa_00026.mp4",
-            "subfolder": "/home/cseti/data2/AI/training/Video/output/ltx2/crossview_warp_v23_LTX2.3-22B_IC-LoRA/comfyui_user_tests",
+            "subfolder": "",
             "type": "output",
             "format": "video/h264-mp4",
             "frame_rate": 24,
             "workflow": "keyframetest-compa_00026.png",
-            "fullpath": "/home/cseti/data2/AI/training/Video/output/ltx2/crossview_warp_v23_LTX2.3-22B_IC-LoRA/comfyui_user_tests/keyframetest-compa_00026.mp4"
+            "fullpath": ""
           }
         }
       },
       "widgets_values_named": {
         "frame_rate": 24,
         "loop_count": 0,
-        "filename_prefix": "/home/cseti/data2/AI/training/Video/output/ltx2/crossview_warp_v23_LTX2.3-22B_IC-LoRA/comfyui_user_tests/keyframetest-compa",
+        "filename_prefix": "comfyui",
         "format": "video/h264-mp4",
         "pix_fmt": "yuv420p",
         "crf": 19,
@@ -4588,12 +4588,12 @@
           "paused": false,
           "params": {
             "filename": "keyframetest-compa_00026.mp4",
-            "subfolder": "/home/cseti/data2/AI/training/Video/output/ltx2/crossview_warp_v23_LTX2.3-22B_IC-LoRA/comfyui_user_tests",
+            "subfolder": "",
             "type": "output",
             "format": "video/h264-mp4",
             "frame_rate": 24,
             "workflow": "keyframetest-compa_00026.png",
-            "fullpath": "/home/cseti/data2/AI/training/Video/output/ltx2/crossview_warp_v23_LTX2.3-22B_IC-LoRA/comfyui_user_tests/keyframetest-compa_00026.mp4"
+            "fullpath": ""
           }
         }
       }
@@ -4971,7 +4971,7 @@
             "format": "video/h264-mp4",
             "frame_rate": 24,
             "workflow": "1_00001.png",
-            "fullpath": "/home/cseti/ComfyUI2/temp/1_00001-audio.mp4"
+            "fullpath": ""
           }
         }
       },
@@ -4996,7 +4996,7 @@
             "format": "video/h264-mp4",
             "frame_rate": 24,
             "workflow": "1_00001.png",
-            "fullpath": "/home/cseti/ComfyUI2/temp/1_00001-audio.mp4"
+            "fullpath": ""
           }
         }
       }
@@ -5071,7 +5071,7 @@
             "format": "video/h264-mp4",
             "frame_rate": 24,
             "workflow": "t_00001.png",
-            "fullpath": "/home/cseti/ComfyUI2/temp/t_00001.mp4"
+            "fullpath": ""
           }
         }
       },
@@ -5096,7 +5096,7 @@
             "format": "video/h264-mp4",
             "frame_rate": 24,
             "workflow": "t_00001.png",
-            "fullpath": "/home/cseti/ComfyUI2/temp/t_00001.mp4"
+            "fullpath": ""
           }
         }
       }
@@ -5300,7 +5300,7 @@
         "Node name for S&R": "LTXICLoRALoaderModelOnly"
       },
       "widgets_values": [
-        "LTX2/2.3/crossview_warp_v23/v23_step06000.safetensors",
+        "LTX2/LTX2.3-22B_IC-LoRA-CrossView-Warp_v2_6000.safetensors",
         1
       ],
       "widgets_values_named": {
@@ -5707,7 +5707,7 @@
     },
     {
       "id": 5531,
-      "type": "CrossViewWarpDev",
+      "type": "CrossViewWarp",
       "pos": [
         -6138.562971903603,
         4409.076832963384
@@ -5761,7 +5761,7 @@
         }
       ],
       "properties": {
-        "Node name for S&R": "CrossViewWarpDev"
+        "Node name for S&R": "CrossViewWarp"
       },
       "widgets_values": [
         50.4,
