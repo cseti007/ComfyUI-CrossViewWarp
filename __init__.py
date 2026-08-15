@@ -1,8 +1,9 @@
 """CrossView-Warp ComfyUI node package.
 
 Builds the cross-view WARP conditioning that the CrossView-Warp IC-LoRA
-expects, from an input video + a requested relative camera pose. Feed it a
-depth map from an external Depth Anything V2 node.
+expects, from an input video + a requested relative camera pose. Feed it
+geometry from ComfyUI's Run MoGe Inference node, or a depth map from an
+external Depth Anything V2 node.
 
 Install: symlink/copy this folder into ComfyUI/custom_nodes/ and restart ComfyUI.
 """
