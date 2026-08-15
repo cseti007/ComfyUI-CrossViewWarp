@@ -28,17 +28,9 @@ https://huggingface.co/Cseti/LTX2.3-22B_IC-LoRA-CrossView-Warp_v2
 
 ## Demo
 
-Dragging the camera handle: the warp follows the angle, magenta fills what the
-source camera never saw.
+[![Watch on YouTube](https://img.youtube.com/vi/7QAapT9xMgM/maxresdefault.jpg)](https://www.youtube.com/watch?v=7QAapT9xMgM)
 
-![Static camera pose](assets/orbit-default.gif)
-
-With `use_keyframes` on, right-clicking the sphere drops keyframes - each
-labelled with its frame number - and the node interpolates an angle per frame.
-
-![Keyframed camera move](assets/orbit-keyframes.gif)
-
-Both clips show the orbit view; the live preview below is newer than them.
+*Walkthrough video - click to open on YouTube.*
 
 ## Install
 
