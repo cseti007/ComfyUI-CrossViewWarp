@@ -144,7 +144,7 @@
         78
       ],
       "flags": {},
-      "order": 78,
+      "order": 79,
       "mode": 0,
       "inputs": [
         {
@@ -379,7 +379,7 @@
       "flags": {
         "collapsed": true
       },
-      "order": 70,
+      "order": 68,
       "mode": 0,
       "inputs": [
         {
@@ -424,7 +424,7 @@
       "flags": {
         "collapsed": true
       },
-      "order": 79,
+      "order": 78,
       "mode": 0,
       "inputs": [
         {
@@ -644,7 +644,7 @@
       "flags": {
         "collapsed": true
       },
-      "order": 68,
+      "order": 70,
       "mode": 0,
       "inputs": [
         {
@@ -700,7 +700,7 @@
       "flags": {
         "collapsed": true
       },
-      "order": 69,
+      "order": 71,
       "mode": 0,
       "inputs": [
         {
@@ -4407,7 +4407,7 @@
       ],
       "size": [
         971.9345754574645,
-        855.2315604381865
+        334
       ],
       "flags": {},
       "order": 117,
@@ -4507,7 +4507,7 @@
       ],
       "size": [
         2201.9291651684803,
-        1312.0686241103513
+        334
       ],
       "flags": {},
       "order": 95,
@@ -5010,7 +5010,7 @@
       ],
       "size": [
         971.9345754574645,
-        334
+        883.4631986948237
       ],
       "flags": {},
       "order": 86,
@@ -5304,7 +5304,7 @@
         1
       ],
       "widgets_values_named": {
-        "lora_name": "LTX2/2.3/crossview_warp_v23/v23_step06000.safetensors",
+        "lora_name": "LTX2/LTX2.3-22B_IC-LoRA-CrossView-Warp_v2_6000.safetensors",
         "strength_model": 1
       },
       "color": "#223",
@@ -5714,7 +5714,7 @@
       ],
       "size": [
         487.1776486811905,
-        800
+        824
       ],
       "flags": {},
       "order": 76,
@@ -5813,43 +5813,6 @@
       "bgcolor": "#533"
     },
     {
-      "id": 5534,
-      "type": "PrimitiveStringMultiline",
-      "pos": [
-        -8069.6523319655935,
-        3520.52377362173
-      ],
-      "size": [
-        400,
-        200
-      ],
-      "flags": {},
-      "order": 46,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "STRING",
-          "type": "STRING",
-          "links": [
-            14259,
-            14260
-          ]
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "PrimitiveStringMultiline"
-      },
-      "widgets_values": [
-        ""
-      ],
-      "widgets_values_named": {
-        "value": ""
-      },
-      "color": "#232",
-      "bgcolor": "#353"
-    },
-    {
       "id": 5092,
       "type": "FloatConstant",
       "pos": [
@@ -5861,7 +5824,7 @@
         58
       ],
       "flags": {},
-      "order": 47,
+      "order": 46,
       "mode": 0,
       "inputs": [],
       "outputs": [
@@ -5900,7 +5863,7 @@
       "flags": {
         "collapsed": true
       },
-      "order": 71,
+      "order": 69,
       "mode": 0,
       "inputs": [
         {
@@ -5929,6 +5892,43 @@
       },
       "color": "#432",
       "bgcolor": "#653"
+    },
+    {
+      "id": 5534,
+      "type": "PrimitiveStringMultiline",
+      "pos": [
+        -8069.6523319655935,
+        3520.52377362173
+      ],
+      "size": [
+        400,
+        200
+      ],
+      "flags": {},
+      "order": 47,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "links": [
+            14259,
+            14260
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PrimitiveStringMultiline"
+      },
+      "widgets_values": [
+        "Crossview."
+      ],
+      "widgets_values_named": {
+        "value": "Crossview."
+      },
+      "color": "#232",
+      "bgcolor": "#353"
     }
   ],
   "links": [
@@ -8063,10 +8063,10 @@
     },
     "workflowRendererVersion": "LG",
     "ds": {
-      "scale": 0.9849732675809248,
+      "scale": 1.0834705943390182,
       "offset": [
-        8977.276894748164,
-        -4402.22157672758
+        8687.838790928154,
+        -3404.4823007713508
       ]
     }
   },
