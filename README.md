@@ -127,6 +127,11 @@ Run the graph once. The node keeps a downscaled copy of the clip, and from then
 on the preview re-warps it on demand — orbit, dolly, scrub and play without
 queueing anything.
 
+<img src="assets/live-preview.gif" alt="Dragging the live preview" width="380">
+
+Dragging the picture: `azimuth` and `elevation` follow the mouse, the warp
+re-renders per frame, and magenta fills what the source camera never saw.
+
 It calls the same code that produces the output, so it is not an approximation:
 measured against a full run, at most **4 pixels of 147 456** differ, and those
 come from a float32 cast on the metric-geometry path.
