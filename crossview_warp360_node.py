@@ -171,8 +171,8 @@ _EASE = {"linear": lambda u: u, "in": lambda u: u * u, "out": lambda u: 1.0 - (1
 
 def _parse_path(raw, frame_count, interpolation="linear"):
     """Keyframes [{"f": 1-based frame, "x", "y", "z", "ease"?}] -> one position per frame. The curve through the keys is
-    linear or smooth (uniform Catmull-Rom); "ease" (linear | in | out | in_out) times the segment that starts at that
-    key. Before the first key and after the last the camera holds."""
+    linear or smooth (uniform Catmull-Rom); "ease" (linear | in | out | in_out) times the segment that ends at that
+    key (the motion into it). Before the first key and after the last the camera holds."""
     kfs = sorted(json.loads(raw) if raw.strip() else [{"f": 1, "x": 0, "y": 0, "z": 0}], key=lambda k: k["f"])
     fs = np.array([k["f"] for k in kfs], np.float64)
     p = np.array([[k.get("x", 0.0), k.get("y", 0.0), k.get("z", 0.0)] for k in kfs], np.float64)
@@ -186,7 +186,7 @@ def _parse_path(raw, frame_count, interpolation="linear"):
             out.append(p[-1])
             continue
         i = int(np.searchsorted(fs, t, side="right")) - 1
-        u = _EASE[kfs[i].get("ease", "linear")]((t - fs[i]) / (fs[i + 1] - fs[i]))
+        u = _EASE[kfs[i + 1].get("ease", "linear")]((t - fs[i]) / (fs[i + 1] - fs[i]))
         if interpolation == "smooth":
             p0, p1, p2, p3 = q[i], q[i + 1], q[i + 2], q[i + 3]
             out.append(0.5 * (2 * p1 + (p2 - p0) * u + (2 * p0 - 5 * p1 + 4 * p2 - p3) * u * u
@@ -208,7 +208,7 @@ class CrossViewWarp360:
             "path": ("STRING", {"multiline": True, "default": '[{"f": 1, "x": 0, "y": 0, "z": 0}, {"f": 39, "x": 0, "y": 0, "z": 1.0}]',
                                 "tooltip": "Target camera keyframes in metres in the primary source camera's frame (x "
                                            "right, y up, z forward = the image centre); optional \"ease\" per key "
-                                           "(linear | in | out | in_out) times the segment that starts there."}),
+                                           "(linear | in | out | in_out) times the motion into that key."}),
             "source_positions": ("STRING", {"default": "[[0, 0, 0]]",
                                             "tooltip": "Each source frame's camera position (same frame), one per frame."}),
             "distance_scale": ("FLOAT", {"default": 1.0, "min": 0.001, "max": 1000.0, "step": 0.001,
