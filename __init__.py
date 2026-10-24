@@ -9,6 +9,10 @@ Install: symlink/copy this folder into ComfyUI/custom_nodes/ and restart ComfyUI
 """
 
 from .crossview_warp_node import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
+from . import crossview_warp360_node as _w360
+
+NODE_CLASS_MAPPINGS = {**NODE_CLASS_MAPPINGS, **_w360.NODE_CLASS_MAPPINGS}
+NODE_DISPLAY_NAME_MAPPINGS = {**NODE_DISPLAY_NAME_MAPPINGS, **_w360.NODE_DISPLAY_NAME_MAPPINGS}
 
 # Registers no node of its own: it attaches the live-preview cache to the warp
 # node and serves the render endpoint. Imported for those side effects, and
