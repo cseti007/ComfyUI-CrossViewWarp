@@ -169,6 +169,19 @@ _EASE = {"linear": lambda u: u, "in": lambda u: u * u, "out": lambda u: 1.0 - (1
          "in_out": lambda u: u * u * (3.0 - 2.0 * u)}
 
 
+def drop_edges(dist, k, ratio=1.15):
+    """Unknown (NaN) for every pixel within k px of a surface more than `ratio` nearer: the soft depth at an object's
+    outline gives its edge pixels the background's distance, so they stayed put while the object moved and left a
+    ghost outline (a second lamp post, floating leaves) that the model turned into a second object. Dropped, they
+    become holes the model fills. The window wraps around horizontally."""
+    if k <= 0:
+        return dist
+    d = torch.from_numpy(np.where(np.isfinite(dist) & (dist > 0), dist, np.inf).astype(np.float32))[None, None]
+    d = torch.cat([d[..., -k:], d, d[..., :k]], -1)
+    near = -torch.nn.functional.max_pool2d(-d, 2 * k + 1, stride=1, padding=(k, 0))[0, 0].numpy()
+    return np.where(dist > near * ratio, np.nan, dist)
+
+
 def _parse_path(raw, frame_count, interpolation="linear"):
     """Keyframes [{"f": 1-based frame, "x", "y", "z", "ease"?}] -> one position per frame. The curve through the keys is
     linear or smooth (uniform Catmull-Rom); "ease" (linear | in | out | in_out) times the segment that ends at that
@@ -222,6 +235,10 @@ class CrossViewWarp360:
                                               "tooltip": "training: the perspective node's splat exactly (the LoRA's "
                                                          "training format); zbuffer: the radius grows with "
                                                          "magnification and the nearest point wins."}),
+        }, "optional": {
+            "edge_drop": ("INT", {"default": 0, "min": 0, "max": 8,
+                                  "tooltip": "Drop the pixels within this many px behind a depth edge (their soft "
+                                             "depth left a ghost outline of near objects); 0 = off, 2 = typical."}),
         }}
 
     RETURN_TYPES = ("IMAGE",)
@@ -230,7 +247,7 @@ class CrossViewWarp360:
     CATEGORY = "CrossView"
 
     def build(self, frames, moge_geometry, frame_count, path, source_positions, distance_scale, splat, mode="training",
-              interpolation="linear"):
+              interpolation="linear", edge_drop=0):
         rgb = (frames.clamp(0, 1).cpu().numpy() * 255.0).astype(np.uint8)
         d = moge_geometry["depth"].detach().float().cpu().numpy() * float(distance_scale)
         m = moge_geometry.get("mask")
@@ -246,7 +263,7 @@ class CrossViewWarp360:
             if di.shape != (H, W):
                 di = torch.nn.functional.interpolate(torch.from_numpy(di)[None, None], size=(H, W),
                                                      mode="nearest")[0, 0].numpy()
-            srcs.append((rgb[i], di, pos[min(i, len(pos) - 1)]))
+            srcs.append((rgb[i], drop_edges(di, int(edge_drop)), pos[min(i, len(pos) - 1)]))
         warps = warp360_path(srcs, _parse_path(path, frame_count, interpolation), int(splat), mode)
         return (torch.from_numpy(np.stack(warps).astype(np.float32) / 255.0),)
 
