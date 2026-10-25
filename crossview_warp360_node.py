@@ -268,6 +268,62 @@ class CrossViewWarp360:
         return (torch.from_numpy(np.stack(warps).astype(np.float32) / 255.0),)
 
 
+def _sync_wrap(vid, p):
+    """vid (..., W) laid out [left pad p | interior | right pad p], the pads copies of the opposite interior edges:
+    each pad and the interior columns it copies are set to their mean, so both hold one prediction."""
+    w = vid.shape[-1] - 2 * p
+    a = (vid[..., :p] + vid[..., w:w + p]) / 2
+    b = (vid[..., p + w:] + vid[..., p:2 * p]) / 2
+    vid[..., :p], vid[..., w:w + p] = a, a
+    vid[..., p + w:], vid[..., p:2 * p] = b, b
+    return vid
+
+
+class CrossViewWrapSync360:
+    """Model patch for an equirect generated wrap-padded (the opposite edges added left and right): after every model
+    call the pads and the interior columns they copy get one shared prediction, so the model sees the left and right
+    edges as neighbours and the edge band is not generated twice (two copies drift apart: a lamp post on the edge
+    stood twice, 20 px apart). Plain (B, C, T, H, W) and LTX packed audio/video latents."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "model": ("MODEL",),
+            "pad_fraction": ("FLOAT", {"default": 0.0789, "min": 0.0, "max": 0.45, "step": 0.0001,
+                                       "tooltip": "One pad's share of the padded width (pad / (W + 2 pad))."}),
+        }}
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "patch"
+    CATEGORY = "CrossView"
+
+    def patch(self, model, pad_fraction):
+        m = model.clone()
+        prev = m.model_options.get("model_function_wrapper")
+
+        def wrapper(apply_model, args):
+            out = prev(apply_model, args) if prev else apply_model(args["input"], args["timestep"], **args["c"])
+            shapes = args["c"].get("latent_shapes")
+            if out.ndim == 5:
+                p = round(out.shape[-1] * pad_fraction)
+                return _sync_wrap(out.clone(), p) if p else out
+            if out.ndim == 3 and shapes and len(shapes[0]) == 5:     # LTX packed: video tokens first, then audio
+                shape = [int(s) for s in shapes[0]]
+                n = int(np.prod(shape[1:]))
+                p = round(shape[-1] * pad_fraction)
+                if not p or n > out.shape[-1]:
+                    return out
+                b = out.shape[0]
+                vid = _sync_wrap(out[:, :, :n].reshape([b] + shape[1:]).clone(), p).reshape(b, out.shape[1], n)
+                return torch.cat([vid, out[:, :, n:]], dim=-1)
+            return out
+
+        m.set_model_unet_function_wrapper(wrapper)
+        return (m,)
+
+
 _ID = f"CrossViewWarp360{NODE_SUFFIX}"
-NODE_CLASS_MAPPINGS = {_ID: CrossViewWarp360}
-NODE_DISPLAY_NAME_MAPPINGS = {_ID: "CrossView Warp 360 (equirect)" + (f" [{NODE_SUFFIX}]" if NODE_SUFFIX else "")}
+_SYNC = f"CrossViewWrapSync360{NODE_SUFFIX}"
+NODE_CLASS_MAPPINGS = {_ID: CrossViewWarp360, _SYNC: CrossViewWrapSync360}
+NODE_DISPLAY_NAME_MAPPINGS = {_ID: "CrossView Warp 360 (equirect)" + (f" [{NODE_SUFFIX}]" if NODE_SUFFIX else ""),
+                              _SYNC: "CrossView Wrap Sync 360" + (f" [{NODE_SUFFIX}]" if NODE_SUFFIX else "")}
