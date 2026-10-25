@@ -322,8 +322,31 @@ class CrossViewWrapSync360:
         return (m,)
 
 
+class CrossViewDistance360:
+    """Metric distance maps from an .npz in the input folder ("distance": (N, H, W) or (H, W), metres along each ray;
+    NaN or <= 0 = unknown) as the warp's geometry: one map per source frame, for sources whose depth was measured or
+    aligned outside the graph (earlier generated frames used as the warp's memory)."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"distance_file": ("STRING", {"default": ""})}}
+
+    RETURN_TYPES = ("MOGE_GEOMETRY",)
+    FUNCTION = "load"
+    CATEGORY = "CrossView"
+
+    def load(self, distance_file):
+        import folder_paths
+        d = np.load(folder_paths.get_annotated_filepath(distance_file))["distance"].astype(np.float32)
+        d = torch.from_numpy(d if d.ndim == 3 else d[None])
+        mask = torch.isfinite(d) & (d > 0)
+        return ({"depth": torch.where(mask, d, torch.zeros_like(d)), "mask": mask},)
+
+
 _ID = f"CrossViewWarp360{NODE_SUFFIX}"
 _SYNC = f"CrossViewWrapSync360{NODE_SUFFIX}"
-NODE_CLASS_MAPPINGS = {_ID: CrossViewWarp360, _SYNC: CrossViewWrapSync360}
+_DIST = f"CrossViewDistance360{NODE_SUFFIX}"
+NODE_CLASS_MAPPINGS = {_ID: CrossViewWarp360, _SYNC: CrossViewWrapSync360, _DIST: CrossViewDistance360}
 NODE_DISPLAY_NAME_MAPPINGS = {_ID: "CrossView Warp 360 (equirect)" + (f" [{NODE_SUFFIX}]" if NODE_SUFFIX else ""),
-                              _SYNC: "CrossView Wrap Sync 360" + (f" [{NODE_SUFFIX}]" if NODE_SUFFIX else "")}
+                              _SYNC: "CrossView Wrap Sync 360" + (f" [{NODE_SUFFIX}]" if NODE_SUFFIX else ""),
+                              _DIST: "CrossView Distance 360 (npz)" + (f" [{NODE_SUFFIX}]" if NODE_SUFFIX else "")}
