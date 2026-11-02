@@ -824,6 +824,13 @@ class CrossViewWarp:
                     "tooltip": "Playhead for the live preview, counted from 1. The scrub "
                     "bar under the preview drives it; it does not affect the "
                     "output and needs no re-run."}),
+                "scale_smooth": ("INT", {"default": 0, "min": 0, "max": 1000, "step": 1,
+                    "tooltip": "MoGe only. MoGe estimates each frame's metric scale on its own, and "
+                    "the scale flickers (1.2% mean, 6% max per frame on a locked-off shot), "
+                    "which shakes the warp. N > 0 rescales every frame so its median depth "
+                    "follows a moving median over +-N frames: the flicker goes, a real slow "
+                    "change (a moving camera) stays. 12 cut the shake from 0.70 to 0.06 px. "
+                    "0 = off. The live preview ignores it."}),
             },
             "hidden": {"unique_id": "UNIQUE_ID"},
         }
@@ -849,7 +856,7 @@ class CrossViewWarp:
               use_keyframes=False, frame_count=0, keyframes="", interp_motion="linear",
               interpolation="linear", keep_source_aim=False,
               camera_info=None, moge_geometry=None, depth=None, pivot_mask=None,
-              preview_size=384, frame_index=1, unique_id=None):
+              preview_size=384, frame_index=1, scale_smooth=0, unique_id=None):
         # frames: [B,H,W,C] float [0,1]; depth: [B,H,W,C] brightness [0,1]
         rgb = (frames.clamp(0, 1).cpu().numpy() * 255.0).astype(np.uint8)   # [B,H,W,3]
         B, H, W = rgb.shape[:3]
@@ -887,6 +894,12 @@ class CrossViewWarp:
         # metric depth IS z; the mapping exists only to invent a scale for a
         # relative map, so applying it here would throw the metres away
         z = metric_z if metric_z is not None else _depth_to_z(depth_bhw, invert_depth, depth_ratio)
+        if scale_smooth > 0 and metric_z is not None and B > 1:
+            # one factor per frame: its median depth onto the moving median of all frames' medians
+            m = np.array([np.nanmedian(zi) for zi in z])
+            r = int(scale_smooth)
+            target = np.array([np.median(m[max(0, i - r): i + r + 1]) for i in range(B)])
+            z = z * (target / m)[:, None, None]
 
         if 0.0 < hfov < 20.0:
             raise ValueError(
