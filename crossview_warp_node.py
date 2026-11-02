@@ -807,6 +807,11 @@ class CrossViewWarp:
                     "viewport. When connected the pose comes from it, and the "
                     "orbit controls - angles, distance, hfov, the "
                     "pivot and the keyframe path - are all ignored."}),
+                "pivot_mask": ("MASK", {
+                    "tooltip": "The subject to orbit (e.g. a SAM3 mask). When connected the pivot "
+                    "is the median 3D point inside the mask on the first frame - the "
+                    "subject's real depth and position - instead of the auto pivot or "
+                    "pivot_x/y/z. The value is logged as 'CrossViewWarp: pivot from mask'."}),
                 # APPENDED, never inserted: widget values are positional. The
                 # sockets above take no slot, so these land after keep_source_aim.
                 "preview_size": ("INT", {"default": 512, "min": 128, "max": 768, "step": 32,
@@ -843,7 +848,7 @@ class CrossViewWarp:
               roll_lock=True, pivot_override=True, pivot_x=0.0, pivot_y=0.0, pivot_z=1.05,
               use_keyframes=False, frame_count=0, keyframes="", interp_motion="linear",
               interpolation="linear", keep_source_aim=False,
-              camera_info=None, moge_geometry=None, depth=None,
+              camera_info=None, moge_geometry=None, depth=None, pivot_mask=None,
               preview_size=384, frame_index=1, unique_id=None):
         # frames: [B,H,W,C] float [0,1]; depth: [B,H,W,C] brightness [0,1]
         rgb = (frames.clamp(0, 1).cpu().numpy() * 255.0).astype(np.uint8)   # [B,H,W,3]
@@ -927,7 +932,18 @@ class CrossViewWarp:
         # aim, matching the training warps' real-camera framing; a nearest-
         # cluster pivot would zoom the orbit camera into the subject)
         pivot = np.median(Xw0[fin], axis=0)
-        if pivot_override:
+        sel = None
+        if pivot_mask is not None:   # the subject's own 3D points on frame 0 (the auto pivot can land far behind it)
+            m = pivot_mask[0] if pivot_mask.dim() == 3 else pivot_mask
+            m = torch.nn.functional.interpolate(m[None, None].float().cpu(), size=(H, W), mode="nearest")[0, 0]
+            sel = (m.numpy() > 0.5) & np.isfinite(z0) & (z0 > 0)
+            if not sel.any():
+                logging.warning("CrossViewWarp: pivot_mask has no valid depth on frame 0 - pivot unchanged")
+                sel = None
+        if sel is not None:
+            pivot = np.median(Xw0[sel], axis=0)
+            logging.info("CrossViewWarp: pivot from mask %s", [round(float(v), 4) for v in pivot])
+        elif pivot_override:
             pivot = np.array([pivot_x, pivot_y, pivot_z], dtype=np.float64)
 
         # Where the orbiting camera LOOKS. The source camera sits at the origin
