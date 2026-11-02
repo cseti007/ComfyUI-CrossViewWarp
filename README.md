@@ -111,6 +111,19 @@ Key widgets (all have tooltips in the UI):
   nearest thing in the middle of the frame, which is usually your subject. The
   orbit radius is `distance × |pivot|`, so moving the pivot back also widens
   the arc.
+- `pivot_mask` (optional MASK input, e.g. a SAM3 mask of the subject) — the pivot
+  becomes the median 3D point inside the mask on the first frame: the subject's
+  real depth and position, instead of the auto pivot or `pivot_x/y/z`. Use it when
+  the subject is off-centre or sits in front of a deep background, where the auto
+  pivot lands behind it. The value is logged as `CrossViewWarp: pivot from mask`.
+- `scale_smooth` (default 0 = off, MoGe only) — MoGe estimates each frame's metric
+  scale on its own, and it flickers (1.2% mean, 6% max per frame) and drifts
+  (28% over 8 s on a locked-off shot), which shakes the warp and makes the zoom
+  breathe. N > 0 rescales every frame so its median depth follows a moving median
+  over ±N frames; a value at least the clip length gives one scale for the whole
+  clip, the right choice for a static source camera (zoom range 18% -> 0.08%).
+  12 removes the frame-to-frame flicker but keeps slow drift. The live preview
+  ignores it.
 - `keep_source_aim` (default off) — orbit around the pivot but keep the camera
   pointed where the source was pointed, which is what the training data does.
   Measured against the training warps on 12 scenes it scores 28.9 against 42.3
