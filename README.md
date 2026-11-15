@@ -5,6 +5,8 @@ The companion ComfyUI node for my CrossView-Warp IC-LoRA (LTX-Video 2.3, 22B) â€
 is the current one, [v0.9](https://huggingface.co/Cseti/LTX2.3-22B_IC-LoRA-CrossView-Warp)
 the first release.
 
+[![swm cloud](https://img.shields.io/badge/swm%20cloud-Launch%20Pre--Loaded%20Workspace-0A66C2)](https://cloud.swmgpu.com/w/samofvaani/reangle-reshoot-4d-camera-studio)
+
 You give it a video and a camera offset, and it builds the depth-warp
 conditioning the LoRA expects: the input reprojected into the new viewpoint,
 with magenta holes where the original camera never saw anything.
@@ -41,6 +43,8 @@ git clone https://github.com/cseti007/ComfyUI-CrossViewWarp
 
 Then restart ComfyUI and refresh the browser. There are no required packages to
 install â€” the node runs on NumPy + PyTorch, which ComfyUI already provides.
+
+> **No local high-VRAM GPU?** Launch the pre-loaded [**swm cloud** workspace](https://cloud.swmgpu.com/w/samofvaani/reangle-reshoot-4d-camera-studio) with `ComfyUI-CrossViewWarp`, `LTX2.3-22B_IC-LoRA-CrossView-Warp_v2`, `MoGe`, and `LTX-2.5` weights ready to run.
 
 ### Optional: faster warp (numba)
 
